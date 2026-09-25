@@ -50,15 +50,24 @@ def scan_services(session, region: str | None) -> list[dict[str, Any]]:
                         "cluster": carn,
                         "task_definition": svc.get("taskDefinition"),
                         "load_balancer": [
-                            {"target_group_arn": lb["targetGroupArn"]}
+                            {
+                                "target_group_arn": lb["targetGroupArn"],
+                                "container_name": lb.get("containerName"),
+                                "container_port": lb.get("containerPort"),
+                            }
                             for lb in svc.get("loadBalancers", [])
                             if lb.get("targetGroupArn")
                         ],
                         "network_configuration": [
-                            {"subnets": net_cfg.get("subnets", []), "security_groups": net_cfg.get("securityGroups", [])}
+                            {
+                                "subnets": net_cfg.get("subnets", []),
+                                "security_groups": net_cfg.get("securityGroups", []),
+                                "assign_public_ip": net_cfg.get("assignPublicIp") == "ENABLED",
+                            }
                         ]
                         if net_cfg
                         else [],
+                        "launch_type": svc.get("launchType"),
                         "desired_count": svc.get("desiredCount"),
                         "running_count": svc.get("runningCount"),
                     },
@@ -87,6 +96,17 @@ def scan_task_definitions(session, region: str | None) -> list[dict[str, Any]]:
                     "cpu": td.get("cpu"),
                     "memory": td.get("memory"),
                     "container_definitions": [c.get("name") for c in td.get("containerDefinitions", [])],
+                    "network_mode": td.get("networkMode"),
+                    "port_mappings": [
+                        {
+                            "container_name": c.get("name"),
+                            "container_port": pm.get("containerPort"),
+                            "host_port": pm.get("hostPort"),
+                            "protocol": pm.get("protocol", "tcp"),
+                        }
+                        for c in td.get("containerDefinitions", [])
+                        for pm in c.get("portMappings", [])
+                    ],
                 },
                 arn=arn,
             )

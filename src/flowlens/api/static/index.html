@@ -34,6 +34,18 @@
   .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 4px; color: var(--muted); }
   .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
   #stats { font-size: 12px; color: var(--muted); }
+  /* Reachability mode: every state has a text label + icon, never color alone. */
+  .reach-status { display: inline-block; padding: 2px 8px; border-radius: 3px; font-weight: 700; font-size: 12px; }
+  .reach-ALLOWED { background: #1e4d33; color: #bff5d4; border: 1px solid #3ddc84; }
+  .reach-BLOCKED { background: #4d1e1e; color: #ffd0d0; border: 2px dashed #ff5c5c; }
+  .reach-UNKNOWN { background: #4d431e; color: #fff0c0; border: 2px dotted #f5c323; }
+  .reach-NOT_APPLICABLE { background: #2a2f3a; color: #c0c6d0; border: 1px solid #5a6472; }
+  .check { font-size: 11px; padding: 4px 6px; margin: 3px 0; border-radius: 3px; background: #10131a; cursor: pointer; }
+  .check:hover { outline: 1px solid var(--accent); }
+  .check.selected { outline: 2px solid var(--accent); }
+  .hop { font-size: 11px; margin: 2px 0; }
+  #reachResult .muted { color: var(--muted); font-size: 11px; }
+  #reachEvidence pre { white-space: pre-wrap; word-break: break-all; background: #10131a; padding: 6px; border-radius: 4px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -53,6 +65,20 @@
       <select id="endSelect"></select>
       <button id="pathBtn">Highlight path</button>
       <button id="clearBtn" class="secondary">Clear highlight</button>
+    </section>
+
+    <section>
+      <label>Reachability — can traffic flow? (deterministic)</label>
+      <select id="reachSource" title="source"></select>
+      <select id="reachDest" title="destination"></select>
+      <div style="display:flex;gap:6px;">
+        <select id="reachProto" style="width:45%"><option value="tcp">TCP</option><option value="udp">UDP</option>
+          <option value="icmp">ICMP</option><option value="-1">ALL (-1)</option></select>
+        <input id="reachPort" placeholder="port e.g. 443" value="443" style="width:55%" />
+      </div>
+      <button id="reachBtn">Analyze Reachability</button>
+      <div id="reachResult"></div>
+      <div id="reachEvidence"></div>
     </section>
 
     <section>
@@ -116,6 +142,12 @@ async function loadGraph() {
       }},
       { selector: '.highlighted', style: { 'line-color': '#7c6cf6', 'target-arrow-color': '#7c6cf6', 'width': 3, 'opacity': 1 } },
       { selector: 'node.highlighted', style: { 'border-color': '#7c6cf6', 'border-width': 3 } },
+      { selector: 'node.reach-ALLOWED', style: { 'border-color': '#3ddc84', 'border-width': 4, 'border-style': 'solid' } },
+      { selector: 'node.reach-BLOCKED', style: { 'border-color': '#ff5c5c', 'border-width': 4, 'border-style': 'dashed' } },
+      { selector: 'node.reach-UNKNOWN', style: { 'border-color': '#f5c323', 'border-width': 4, 'border-style': 'dotted' } },
+      { selector: 'node.reach-node', style: { 'label': 'data(reachLabel)', 'font-weight': 'bold' } },
+      { selector: 'edge.reach-edge', style: { 'line-color': '#7c6cf6', 'target-arrow-color': '#7c6cf6', 'width': 3, 'opacity': 1 } },
+      { selector: 'node.reach-focus', style: { 'overlay-color': '#7c6cf6', 'overlay-opacity': 0.35, 'overlay-padding': 6 } },
     ],
     layout: { name: 'cose', animate: false, padding: 30 },
   });
@@ -176,7 +208,113 @@ document.getElementById('pathBtn').addEventListener('click', async () => {
 
 document.getElementById('clearBtn').addEventListener('click', () => {
   if (cy) cy.elements().removeClass('highlighted');
+  clearReach();
 });
+
+// --- Reachability mode --------------------------------------------------------
+const STATUS_TEXT = { ALLOWED: '✔ ALLOWED', BLOCKED: '✖ BLOCKED', UNKNOWN: '? UNKNOWN', NOT_APPLICABLE: '– N/A' };
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let lastReach = null;
+
+async function loadReachEndpoints() {
+  const data = await fetchJSON('/api/reachability/endpoints');
+  for (const id of ['reachSource', 'reachDest']) {
+    const sel = document.getElementById(id);
+    sel.innerHTML = '';
+    for (const ep of data.endpoints) {
+      const o = document.createElement('option');
+      o.value = ep.id; o.textContent = ep.label;
+      sel.appendChild(o);
+    }
+  }
+  if (data.endpoints.length > 1) document.getElementById('reachDest').selectedIndex = data.endpoints.length - 1;
+}
+
+function clearReach() {
+  if (!cy) return;
+  cy.nodes().removeClass('reach-ALLOWED reach-BLOCKED reach-UNKNOWN reach-node reach-focus');
+  cy.edges().removeClass('reach-edge');
+}
+
+function highlightReach(result) {
+  clearReach();
+  const worst = { ALLOWED: 0, NOT_APPLICABLE: 0, UNKNOWN: 1, BLOCKED: 2 };
+  const nodeStatus = {};
+  for (const hop of result.path) {
+    for (const id of hop.nodes) {
+      if (!nodeStatus[id] || worst[hop.status] > worst[nodeStatus[id]]) nodeStatus[id] = hop.status;
+    }
+  }
+  const ids = Object.keys(nodeStatus);
+  for (const id of ids) {
+    const n = cy.getElementById(id);
+    if (!n.nonempty()) continue;
+    n.data('reachLabel', `${STATUS_TEXT[nodeStatus[id]]}\n${n.data('name')}\n(${n.data('resource_type')})`);
+    n.addClass('reach-node reach-' + nodeStatus[id]);
+  }
+  cy.edges().filter(e => ids.includes(e.data('source')) && ids.includes(e.data('target'))).addClass('reach-edge');
+}
+
+function renderReach(result) {
+  lastReach = result;
+  const box = document.getElementById('reachResult');
+  const hops = result.path.map(h =>
+    `<div class="hop"><span class="reach-status reach-${h.status}">${STATUS_TEXT[h.status]}</span> ${h.index}. ${esc(h.from)} → ${esc(h.to)}
+     <span class="muted">[${h.kind}, ${h.kind === 'forward' ? esc(h.port_in) + ' → ' + esc(h.port_out) : esc(h.traffic)}]</span></div>`).join('');
+  const checks = result.checks.map((c, i) =>
+    `<div class="check" data-idx="${i}"><span class="reach-status reach-${c.status}">${STATUS_TEXT[c.status]}</span>
+     hop ${c.hop_index} <b>${esc(c.check_type)}</b>: ${esc(c.reason)}</div>`).join('');
+  const others = result.candidates.filter(c => !c.chosen).map(c =>
+    `<div class="muted">${STATUS_TEXT[c.status]} ${esc(c.label)}${c.reason ? ' — ' + esc(c.reason) : ''}</div>`).join('');
+  box.innerHTML = `
+    <div style="margin:6px 0;"><span class="reach-status reach-${result.overall_status}">RESULT: ${STATUS_TEXT[result.overall_status]}</span></div>
+    <div class="muted">${esc(result.traffic)} · ${esc(result.source)} → ${esc(result.destination)}</div>
+    ${result.topology_connected !== null ? `<div class="muted">Topology: ${result.topology_connected ? 'connected' : 'not connected'} in graph (not proof of reachability)</div>` : ''}
+    <label style="margin-top:6px;">Path</label><div style="font-size:11px;">${esc(result.path_label)}</div>
+    <label style="margin-top:6px;">Hops</label>${hops}
+    ${result.blocked_at ? `<div style="margin-top:6px;font-size:12px;"><b>${result.overall_status === 'BLOCKED' ? 'Blocked at' : 'Undetermined at'}:</b> ${esc(result.blocked_at)}</div>` : ''}
+    <div style="font-size:12px;"><b>Reason:</b> ${esc(result.reason)}</div>
+    ${result.suggestions.map(s => `<div class="muted">Suggested investigation: ${esc(s)}</div>`).join('')}
+    <label style="margin-top:6px;">Validation (click a check for evidence)</label>${checks}
+    ${others ? `<label style="margin-top:6px;">Other candidate paths</label>${others}` : ''}
+    ${result.uncertainties.length ? `<label style="margin-top:6px;">Uncertainties / not evaluated</label>` + result.uncertainties.map(u => `<div class="muted">• ${esc(u)}</div>`).join('') : ''}
+  `;
+  document.getElementById('reachEvidence').innerHTML = '';
+  for (const el of box.querySelectorAll('.check')) {
+    el.addEventListener('click', () => showCheckEvidence(Number(el.dataset.idx), el));
+  }
+  highlightReach(result);
+}
+
+function showCheckEvidence(idx, el) {
+  const c = lastReach.checks[idx];
+  document.querySelectorAll('#reachResult .check').forEach(x => x.classList.remove('selected'));
+  el.classList.add('selected');
+  cy.nodes().removeClass('reach-focus');
+  for (const id of c.resources) cy.getElementById(id).addClass('reach-focus');
+  document.getElementById('reachEvidence').innerHTML = `
+    <label style="margin-top:8px;">Evidence — ${esc(c.check_type)} (${STATUS_TEXT[c.status]})</label>
+    <div style="font-size:11px;">${esc(c.source)} → ${esc(c.destination)}</div>
+    <pre>${c.evidence.length ? c.evidence.map(esc).join('\n') : '(no evidence lines)'}</pre>
+    ${c.suggestion ? `<div class="muted">Suggested investigation: ${esc(c.suggestion)}</div>` : ''}`;
+}
+
+document.getElementById('reachBtn').addEventListener('click', async () => {
+  const body = {
+    source: document.getElementById('reachSource').value,
+    destination: document.getElementById('reachDest').value,
+    protocol: document.getElementById('reachProto').value,
+    port: document.getElementById('reachPort').value || null,
+  };
+  const box = document.getElementById('reachResult');
+  box.innerHTML = '<div class="muted">Analyzing…</div>';
+  const res = await fetch('/api/reachability', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) { box.innerHTML = `<div class="reach-status reach-UNKNOWN">Error</div> <span class="muted">${esc(data.detail)}</span>`; return; }
+  renderReach(data);
+});
+
+loadReachEndpoints().catch(err => { document.getElementById('reachResult').innerText = 'Failed to load endpoints: ' + err.message; });
 
 loadGraph().catch(err => {
   document.getElementById('stats').innerText = 'Failed to load graph: ' + err.message;

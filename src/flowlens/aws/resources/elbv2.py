@@ -27,7 +27,10 @@ def scan_load_balancers(session, region: str | None) -> list[dict[str, Any]]:
                 "subnets": [az["SubnetId"] for az in lb.get("AvailabilityZones", [])],
                 "security_groups": lb.get("SecurityGroups", []),
                 "scheme": lb.get("Scheme"),
+                "internal": lb.get("Scheme") == "internal" if lb.get("Scheme") else None,
                 "type": lb.get("Type"),
+                "load_balancer_type": lb.get("Type"),
+                "ip_address_type": lb.get("IpAddressType"),
             },
             arn=lb["LoadBalancerArn"],
         )
@@ -36,7 +39,19 @@ def scan_load_balancers(session, region: str | None) -> list[dict[str, Any]]:
 
 
 def _target_group_actions(actions: list[dict[str, Any]]) -> list[dict[str, str]]:
-    return [{"target_group_arn": a["TargetGroupArn"]} for a in actions if a.get("TargetGroupArn")]
+    """Forward actions only (kept backward compatible: one dict per target group)."""
+    out = []
+    for a in actions:
+        arns = [a["TargetGroupArn"]] if a.get("TargetGroupArn") else []
+        for tg in (a.get("ForwardConfig") or {}).get("TargetGroups", []):
+            if tg.get("TargetGroupArn") and tg["TargetGroupArn"] not in arns:
+                arns.append(tg["TargetGroupArn"])
+        out.extend({"target_group_arn": arn} for arn in arns)
+    return out
+
+
+def _action_types(actions: list[dict[str, Any]]) -> list[str]:
+    return [str(a.get("Type", "")).lower() for a in actions]
 
 
 def scan_listeners(session, region: str | None) -> list[dict[str, Any]]:
@@ -55,6 +70,7 @@ def scan_listeners(session, region: str | None) -> list[dict[str, Any]]:
                         "protocol": listener.get("Protocol"),
                         "port": listener.get("Port"),
                         "default_action": _target_group_actions(listener.get("DefaultActions", [])),
+                        "default_action_types": _action_types(listener.get("DefaultActions", [])),
                     },
                     arn=larn,
                 )
@@ -75,25 +91,54 @@ def scan_listener_rules(session, region: str | None) -> list[dict[str, Any]]:
                         "listener_rule",
                         rarn,
                         rarn,
-                        {"listener_arn": larn, "action": _target_group_actions(rule.get("Actions", []))},
+                        {
+                            "listener_arn": larn,
+                            "action": _target_group_actions(rule.get("Actions", [])),
+                            "action_types": _action_types(rule.get("Actions", [])),
+                            "priority": rule.get("Priority"),
+                            "is_default": rule.get("IsDefault", False),
+                        },
                         arn=rarn,
                     )
                 )
     return out
 
 
+_L4_PROTOCOLS = ("TCP", "UDP", "TLS", "TCP_UDP")
+
+
+def _preserve_client_ip(elbv2, tg_arn: str) -> str | None:
+    """`preserve_client_ip.enabled` target group attribute (NLB), if readable."""
+    try:
+        attrs = elbv2.describe_target_group_attributes(TargetGroupArn=tg_arn).get("Attributes", [])
+    except Exception:  # noqa: BLE001 - optional detail; absence is reported as unknown downstream
+        return None
+    return next((a.get("Value") for a in attrs if a.get("Key") == "preserve_client_ip.enabled"), None)
+
+
 def scan_target_groups(session, region: str | None) -> list[dict[str, Any]]:
     elbv2 = client(session, SERVICE, region)
-    return [
-        resource(
-            "target_group",
-            tg["TargetGroupArn"],
-            tg.get("TargetGroupName"),
-            {"name": tg.get("TargetGroupName"), "vpc_id": tg.get("VpcId"), "protocol": tg.get("Protocol"), "port": tg.get("Port")},
-            arn=tg["TargetGroupArn"],
+    out = []
+    for tg in elbv2.describe_target_groups().get("TargetGroups", []):
+        arn = tg["TargetGroupArn"]
+        out.append(
+            resource(
+                "target_group",
+                arn,
+                tg.get("TargetGroupName"),
+                {
+                    "name": tg.get("TargetGroupName"),
+                    "vpc_id": tg.get("VpcId"),
+                    "protocol": tg.get("Protocol"),
+                    "port": tg.get("Port"),
+                    "target_type": tg.get("TargetType"),
+                    "load_balancer_arns": tg.get("LoadBalancerArns", []),
+                    "preserve_client_ip": _preserve_client_ip(elbv2, arn) if tg.get("Protocol") in _L4_PROTOCOLS else None,
+                },
+                arn=arn,
+            )
         )
-        for tg in elbv2.describe_target_groups().get("TargetGroups", [])
-    ]
+    return out
 
 
 RESOURCE_SCANNERS = {

@@ -9,3 +9,4 @@ data/*.db
 .build_spec.md
 .gapfill_spec.md
 .ruff_cache/
+.phase2_spec.md

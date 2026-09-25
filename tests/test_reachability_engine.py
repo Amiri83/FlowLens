@@ -298,10 +298,20 @@ def test_nlb_instance_targets_see_client_ip():
 def test_multiple_candidates_prefers_allowed_path():
     result = ReachabilityEngine(Stack().build()).analyze("internet", f"ecs_service:{SVC_ARN}", "tcp", 443)
     statuses = sorted(c["status"] for c in result.candidates)
-    assert statuses == ["ALLOWED", "BLOCKED"]  # direct (no public IP) and via the ALB
+    # Via the ALB, and direct: the ECS service has no public IP, which is not a failure
+    # when it is reached privately through the ALB.
+    assert statuses == ["ALLOWED", "NOT_APPLICABLE"]
     chosen = next(c for c in result.candidates if c["chosen"])
     assert chosen["status"] == "ALLOWED" and "ALB" in chosen["label"]
     assert result.limits["max_candidates"] >= result.limits["evaluated_candidates"]
+
+
+def test_direct_path_without_public_ip_and_no_lb_is_still_blocked():
+    stack = Stack().remove(LISTENER_ARN).remove(TG_ARN).remove(ALB_ARN)
+    result = ReachabilityEngine(stack.build()).analyze("internet", f"ecs_service:{SVC_ARN}", "tcp", 443)
+    assert result.overall_status == B
+    assert check(result, "exposure").status == B and "has no public IP" in check(result, "exposure").reason
+    assert [c["status"] for c in result.candidates] == ["BLOCKED"]
 
 
 def test_blocked_path_reported_is_the_one_that_got_furthest():

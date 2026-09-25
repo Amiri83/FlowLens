@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>FlowLens</title>
+<script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2f3a; --text: #e6e9ef; --muted: #9aa4b2;
+    --ok: #3ddc84; --desired: #f5a623; --actual: #4a9eff; --drift: #ff5c5c; --unknown: #5a6472;
+    --accent: #7c6cf6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  #app { display: flex; height: 100vh; }
+  #sidebar { width: 340px; padding: 16px; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; }
+  #graph { flex: 1; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  section { margin-bottom: 20px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  select, button, input { width: 100%; padding: 6px 8px; margin-bottom: 8px; background: #1f2430; color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+  button { background: var(--accent); border: none; cursor: pointer; font-weight: 600; }
+  button:hover { opacity: 0.9; }
+  button.secondary { background: #1f2430; border: 1px solid var(--border); }
+  #detail { font-size: 12px; }
+  #detail pre { white-space: pre-wrap; word-break: break-all; background: #10131a; padding: 8px; border-radius: 4px; max-height: 260px; overflow-y: auto; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px; }
+  .status-ok { background: var(--ok); color: #06231a; }
+  .status-desired_only { background: var(--desired); color: #2b1b00; }
+  .status-actual_only { background: var(--actual); color: #001b33; }
+  .status-drifted { background: var(--drift); color: #350000; }
+  .status-unknown { background: var(--unknown); color: #fff; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 4px; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  #stats { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>FlowLens</h1>
+    <div class="sub">Local infrastructure topology</div>
+
+    <section>
+      <div id="stats">Loading…</div>
+    </section>
+
+    <section>
+      <label>Find path — start</label>
+      <select id="startSelect"></select>
+      <label>Find path — end</label>
+      <select id="endSelect"></select>
+      <button id="pathBtn">Highlight path</button>
+      <button id="clearBtn" class="secondary">Clear highlight</button>
+    </section>
+
+    <section>
+      <label>Status legend</label>
+      <div class="legend-item"><span class="dot" style="background:var(--ok)"></span>ok (in Terraform &amp; AWS)</div>
+      <div class="legend-item"><span class="dot" style="background:var(--desired)"></span>desired only (Terraform, not observed)</div>
+      <div class="legend-item"><span class="dot" style="background:var(--actual)"></span>actual only (AWS, not in Terraform)</div>
+      <div class="legend-item"><span class="dot" style="background:var(--drift)"></span>drifted</div>
+      <div class="legend-item"><span class="dot" style="background:var(--unknown)"></span>unknown</div>
+    </section>
+
+    <section>
+      <label>Details</label>
+      <div id="detail">Click a node or edge for details.</div>
+    </section>
+  </div>
+  <div id="graph"></div>
+</div>
+
+<script>
+const statusColor = {
+  ok: '#3ddc84', desired_only: '#f5a623', actual_only: '#4a9eff', drifted: '#ff5c5c', unknown: '#5a6472'
+};
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+let cy;
+
+async function loadGraph() {
+  const [graph, status] = await Promise.all([fetchJSON('/api/graph'), fetchJSON('/api/status')]);
+  document.getElementById('stats').innerText =
+    `${status.node_count} nodes · ${status.edge_count} edges`;
+
+  const elements = [];
+  for (const n of graph.nodes) {
+    elements.push({ data: { id: n.id, label: `${n.name}\n(${n.resource_type})`, ...n }, classes: n.status });
+  }
+  for (const e of graph.edges) {
+    elements.push({
+      data: { id: e.id, source: e.source_node, target: e.target_node, label: e.relationship_type, ...e },
+    });
+  }
+
+  cy = cytoscape({
+    container: document.getElementById('graph'),
+    elements,
+    style: [
+      { selector: 'node', style: {
+          'label': 'data(label)', 'font-size': 8, 'color': '#e6e9ef', 'text-wrap': 'wrap',
+          'text-valign': 'bottom', 'text-margin-y': 4,
+          'background-color': ele => statusColor[ele.data('status')] || statusColor.unknown,
+          'width': 28, 'height': 28, 'border-width': 1, 'border-color': '#0f1115',
+      }},
+      { selector: 'edge', style: {
+          'width': 1.5, 'line-color': '#3a4152', 'target-arrow-color': '#3a4152', 'target-arrow-shape': 'triangle',
+          'curve-style': 'bezier', 'label': 'data(label)', 'font-size': 6, 'color': '#9aa4b2', 'opacity': 0.85,
+      }},
+      { selector: '.highlighted', style: { 'line-color': '#7c6cf6', 'target-arrow-color': '#7c6cf6', 'width': 3, 'opacity': 1 } },
+      { selector: 'node.highlighted', style: { 'border-color': '#7c6cf6', 'border-width': 3 } },
+    ],
+    layout: { name: 'cose', animate: false, padding: 30 },
+  });
+
+  const startSel = document.getElementById('startSelect');
+  const endSel = document.getElementById('endSelect');
+  startSel.innerHTML = '';
+  endSel.innerHTML = '';
+  for (const n of graph.nodes.sort((a, b) => a.name.localeCompare(b.name))) {
+    const opt = () => { const o = document.createElement('option'); o.value = n.id; o.textContent = `${n.name} (${n.resource_type})`; return o; };
+    startSel.appendChild(opt());
+    endSel.appendChild(opt());
+  }
+
+  cy.on('tap', 'node', evt => showDetail(evt.target.data(), 'node'));
+  cy.on('tap', 'edge', evt => showDetail(evt.target.data(), 'edge'));
+}
+
+function showDetail(data, kind) {
+  const detail = document.getElementById('detail');
+  if (kind === 'node') {
+    detail.innerHTML = `
+      <div><span class="badge status-${data.status}">${data.status}</span> <b>${data.name}</b></div>
+      <div style="color:var(--muted);margin:4px 0;">${data.resource_type} · ${data.source}</div>
+      <div style="color:var(--muted);">id: ${data.id}</div>
+      ${data.terraform_address ? `<div style="color:var(--muted);">tf: ${data.terraform_address}</div>` : ''}
+      ${data.aws_arn ? `<div style="color:var(--muted);">arn: ${data.aws_arn}</div>` : ''}
+      <label style="margin-top:8px;">desired_state (Terraform)</label>
+      <pre>${data.desired_state ? JSON.stringify(data.desired_state, null, 2) : '—'}</pre>
+      <label>actual_state (AWS)</label>
+      <pre>${data.actual_state ? JSON.stringify(data.actual_state, null, 2) : '—'}</pre>
+    `;
+  } else {
+    detail.innerHTML = `
+      <div><b>${data.relationship_type}</b></div>
+      <div style="color:var(--muted);">${data.source_node} → ${data.target_node}</div>
+      ${data.protocol ? `<div style="color:var(--muted);">protocol: ${data.protocol}</div>` : ''}
+      ${data.port ? `<div style="color:var(--muted);">port: ${data.port}</div>` : ''}
+    `;
+  }
+}
+
+document.getElementById('pathBtn').addEventListener('click', async () => {
+  const start = document.getElementById('startSelect').value;
+  const end = document.getElementById('endSelect').value;
+  if (!start || !end) return;
+  cy.elements().removeClass('highlighted');
+  const result = await fetchJSON(`/api/path?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+  const detail = document.getElementById('detail');
+  if (!result.found) {
+    detail.innerHTML = '<div>No path found between selected nodes.</div>';
+    return;
+  }
+  for (const id of result.nodes) cy.getElementById(id).addClass('highlighted');
+  for (const id of result.edges) cy.getElementById(id).addClass('highlighted');
+  detail.innerHTML = `<div>Path (${result.nodes.length} nodes):</div><pre>${result.nodes.join('\n  ↓\n')}</pre>`;
+});
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  if (cy) cy.elements().removeClass('highlighted');
+});
+
+loadGraph().catch(err => {
+  document.getElementById('stats').innerText = 'Failed to load graph: ' + err.message;
+});
+</script>
+</body>
+</html>

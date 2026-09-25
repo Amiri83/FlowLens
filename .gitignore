@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+data/*.db
+.pytest_cache/
+*.db-journal
+.env
+.build_spec.md
+.gapfill_spec.md
+.ruff_cache/

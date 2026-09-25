@@ -850,6 +850,26 @@ class ReachabilityEngine:
             return max(unknown, key=lambda c: (self._progress(c), -len(c.hops)))
         return max(evaluated, key=lambda c: (self._progress(c), -len(c.hops)))
 
+    def _candidate_summary(self, cand: CandidatePath, chosen: CandidatePath, dst: Endpoint) -> dict:
+        """Summary of one candidate for the result.
+
+        Presentation only (selection already happened): when the chosen path reaches a
+        destination without a public IP privately through a load balancer, the direct
+        internet -> destination candidate's "no public IP" exposure check does not apply
+        to how the traffic flows, so it is reported NOT_APPLICABLE rather than a failure.
+        """
+        summary = dict(cand.summary(), chosen=cand is chosen)
+        via = next((h.from_label for h in chosen.hops if h.kind == "forward"), None)
+        if cand is chosen or via is None or dst.kind == "lb" or dst.public_ip is not False or len(cand.hops) != 1:
+            return summary
+        for i, c in enumerate(cand.checks):
+            if c.check_type == "exposure" and c.status == B and c.destination == dst.display:
+                reason = f"{dst.display} public IP not required for this path: it is reached privately through {via}"
+                cand.checks[i] = self._check("exposure", NA, c.source, c.destination, reason, c.evidence, None,
+                                             c.hop_index, c.resources)
+                summary.update(status=NA.value, reason=reason)
+        return summary
+
     def _result(self, chosen, evaluated, src, dst, protocol, port, truncated, source_ref, dest_ref) -> ReachabilityResult:
         status = chosen.status
         result = ReachabilityResult(
@@ -859,7 +879,7 @@ class ReachabilityEngine:
             limits={"max_candidates": MAX_CANDIDATES, "max_lb_hops": MAX_LB_HOPS, "evaluated_candidates": len(evaluated),
                     "truncated": int(truncated)},
         )
-        result.candidates = [dict(c.summary(), chosen=c is chosen) for c in evaluated]
+        result.candidates = [self._candidate_summary(c, chosen, dst) for c in evaluated]
         decisive = chosen.first_blocking if status == B else chosen.first_unknown if status == U else None
         if decisive is not None:
             hop = chosen.hops[decisive.hop_index - 1] if decisive.hop_index else None

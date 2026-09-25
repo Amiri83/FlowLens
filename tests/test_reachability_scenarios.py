@@ -90,7 +90,25 @@ def test_allowed_scenario_text_report(tmp_db_path):
 def test_multiple_candidates_one_allowed(tmp_db_path):
     _scan("allowed", tmp_db_path)
     data = _reach_json(tmp_db_path, "internet", "aws_ecs_service.app", "--port", "443")
-    assert sorted(c["status"] for c in data["candidates"]) == ["ALLOWED", "BLOCKED"]
+    assert sorted(c["status"] for c in data["candidates"]) == ["ALLOWED", "NOT_APPLICABLE"]
+
+
+def test_private_ecs_behind_alb_has_no_misleading_public_ip_failure(tmp_db_path):
+    """The ECS service is reached privately through the ALB: its missing public IP
+    is NOT_APPLICABLE to that path, not a [FAIL], and the result stays ALLOWED."""
+    _scan("allowed", tmp_db_path)
+    args = ("internet", "aws_ecs_service.app", "--protocol", "tcp", "--port", "443")
+    data = _reach_json(tmp_db_path, *args)
+    assert data["overall_status"] == "ALLOWED"
+    direct = next(c for c in data["candidates"] if not c["chosen"])
+    assert direct["status"] == "NOT_APPLICABLE"
+    assert direct["reason"] == ("ECS service demo-app public IP not required for this path: "
+                                "it is reached privately through ALB demo-alb")
+    text = _run("reachability", *args, "--db", tmp_db_path).output
+    assert "RESULT: ALLOWED" in text
+    assert "no public IP" not in text and "[FAIL]" not in text
+    assert "[ -- ] Internet -> TCP/443 -> ECS service demo-app" in text
+    assert "public IP not required for this path" in text
 
 
 def test_egress_from_private_service_via_nat(tmp_db_path):

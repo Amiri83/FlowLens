@@ -2,30 +2,39 @@
 
 No AI/LLM involved anywhere here — this is a thin, deterministic read layer
 over the SQLite-backed graph plus a couple of pure graph algorithms
-(shortest path) from flowlens.models.graph.Graph.
+(shortest path, desired-vs-actual compare) from flowlens.graph and
+flowlens.compare.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from flowlens.compare.diff import compare_graph, summarize
+from flowlens.graph.traversal import resolve_node_ref, shortest_path
 from flowlens.storage.repository import GraphRepository
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app(db_path: Optional[str] = None) -> FastAPI:
+def create_app(db_path: str | None = None) -> FastAPI:
     db_path = db_path or os.environ.get("FLOWLENS_DB_PATH", "data/flowlens.db")
     app = FastAPI(title="FlowLens", description="Local-first infrastructure visualization", version="0.1.0")
     app.state.db_path = db_path
 
     def _repo() -> GraphRepository:
         return GraphRepository(app.state.db_path)
+
+    def _load():
+        repo = _repo()
+        try:
+            return repo.load_graph()
+        finally:
+            repo.close()
 
     @app.get("/api/graph")
     def get_graph():
@@ -66,12 +75,33 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if path is None:
             return {"found": False, "nodes": [], "edges": []}
         edge_ids = []
-        for a, b in zip(path, path[1:]):
+        for a, b in zip(path, path[1:], strict=False):
             for edge in graph.edges.values():
                 if {edge.source_node, edge.target_node} == {a, b}:
                     edge_ids.append(edge.id)
                     break
         return {"found": True, "nodes": path, "edges": edge_ids}
+
+    @app.get("/api/paths")
+    def get_paths(source: str, target: str, directed: bool = True, max_depth: int | None = None):
+        """Deterministic BFS shortest path. `source`/`target` accept a node id,
+        terraform address, ARN, cloud id or unique name.
+        """
+        graph = _load()
+        src, dst = resolve_node_ref(graph, source), resolve_node_ref(graph, target)
+        if src is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {source}")
+        if dst is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {target}")
+        result = shortest_path(graph, src, dst, directed=directed, max_depth=max_depth)
+        if result is None:
+            return {"found": False, "source": src, "target": dst, "directed": directed, "nodes": [], "edges": [], "hops": []}
+        return {"source": src, "target": dst, "directed": directed, **result.to_dict()}
+
+    @app.get("/api/compare")
+    def get_compare():
+        results = compare_graph(_load())
+        return {"summary": summarize(results), "results": [r.to_dict() for r in results]}
 
     @app.get("/api/status")
     def get_status():
@@ -83,7 +113,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         counts: dict[str, int] = {}
         for node in graph.nodes.values():
             counts[node.status.value] = counts.get(node.status.value, 0) + 1
-        return {"node_count": len(graph.nodes), "edge_count": len(graph.edges), "status_counts": counts}
+        return {
+            "node_count": len(graph.nodes),
+            "edge_count": len(graph.edges),
+            "status_counts": counts,
+            "aws_scan": graph.metadata.get("aws_scan"),
+        }
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -142,3 +142,35 @@ def test_ingest_path_dispatches_on_json_shape(tmp_path):
     )
     graph = ingest_path(plan_file)
     assert len(graph.nodes) == 1
+
+
+def test_raw_tfstate_and_combine_with_config(tmp_path, sample_tf_dir):
+    import json
+
+    from flowlens.ingest.terraform import combine_config_and_state, ingest_path
+
+    raw = {
+        "version": 4,
+        "resources": [
+            {"mode": "managed", "type": "aws_vpc", "name": "main", "instances": [{"attributes": {"id": "vpc-1"}}]},
+            {
+                "mode": "managed",
+                "type": "aws_subnet",
+                "name": "az",
+                "instances": [
+                    {"index_key": 0, "attributes": {"id": "subnet-1", "vpc_id": "vpc-1"}},
+                    {"index_key": 1, "attributes": {"id": "subnet-2", "vpc_id": "vpc-1"}},
+                ],
+            },
+        ],
+    }
+    p = tmp_path / "terraform.tfstate"
+    p.write_text(json.dumps(raw))
+    state = ingest_path(p)
+    assert {n.terraform_address for n in state.nodes.values()} == {"aws_vpc.main", "aws_subnet.az[0]", "aws_subnet.az[1]"}
+    assert "subnet:subnet-2" in state.nodes
+
+    combined = combine_config_and_state(ingest_path(sample_tf_dir), state)
+    assert "tf:aws_vpc.main" not in combined.nodes and "vpc:vpc-1" in combined.nodes
+    assert "tf:aws_subnet.public_a" in combined.nodes  # not in state: kept as config-only
+    assert all(e.source_node in combined.nodes and e.target_node in combined.nodes for e in combined.edges.values())

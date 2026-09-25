@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import hcl2
 
@@ -50,11 +51,13 @@ def ingest_path(path: str | Path) -> Graph:
         return parse_config_dir(p)
     if p.suffix == ".tf":
         return parse_config_dir(p.parent, files=[p])
-    if p.suffix == ".json":
+    if p.suffix in (".json", ".tfstate"):
         data = json.loads(p.read_text())
         if "resource_changes" in data:
             return parse_plan_json(data)
-        if "values" in data or "resources" in data:
+        if _is_raw_tfstate(data):
+            return parse_state_json(raw_tfstate_to_show_json(data))
+        if "values" in data or "resources" in data or "root_module" in data:
             return parse_state_json(data)
         raise ValueError(f"Unrecognized terraform JSON structure in {path}")
     raise ValueError(f"Unsupported terraform input: {path}")
@@ -254,3 +257,65 @@ def parse_plan_json(data: dict[str, Any]) -> Graph:
         _add_depends_on_edges(graph, id_by_address[address], refs, id_by_address)
 
     return graph
+
+
+def _is_raw_tfstate(data: dict[str, Any]) -> bool:
+    """A raw terraform.tfstate (format v4) has top-level `resources` whose
+    entries carry `instances`, unlike `terraform show -json` output.
+    """
+    resources = data.get("resources")
+    return isinstance(resources, list) and any(isinstance(r, dict) and "instances" in r for r in resources)
+
+
+def raw_tfstate_to_show_json(data: dict[str, Any]) -> dict[str, Any]:
+    """Convert a raw terraform.tfstate into the `terraform show -json` shape
+    parse_state_json understands (flattened into the root module; module
+    paths are kept in each resource address).
+    """
+    resources = []
+    for r in data.get("resources", []):
+        prefix = f"{r['module']}." if r.get("module") else ""
+        base = f"{prefix}{'data.' if r.get('mode') == 'data' else ''}{r['type']}.{r['name']}"
+        for inst in r.get("instances", []):
+            key = inst.get("index_key")
+            suffix = "" if key is None else (f"[{key}]" if isinstance(key, int) else f'["{key}"]')
+            resources.append(
+                {
+                    "address": base + suffix,
+                    "mode": r.get("mode", "managed"),
+                    "type": r["type"],
+                    "name": r["name"],
+                    "values": inst.get("attributes") or {},
+                    "depends_on": inst.get("dependencies", []),
+                }
+            )
+    return {"values": {"root_module": {"resources": resources}}}
+
+
+def combine_config_and_state(config: Graph, state: Graph) -> Graph:
+    """Merge a config-only graph with a state graph of the same stack.
+
+    A config node (id "tf:<address>") whose address also appears in state is
+    replaced by the state node (which carries the real cloud id and so can
+    merge with AWS-discovered nodes); edges are re-pointed accordingly.
+    Config-only resources (not applied yet) are kept as-is.
+    """
+    state_id_by_address = {n.terraform_address: n.id for n in state.nodes.values() if n.terraform_address}
+    remap: dict[str, str] = {}
+    result = Graph(metadata={**config.metadata, **state.metadata})
+    for node in state.nodes.values():
+        result.add_node(node)
+    for node in config.nodes.values():
+        state_id = state_id_by_address.get(node.terraform_address or "")
+        if state_id is not None:
+            remap[node.id] = state_id
+        else:
+            result.add_node(node)
+    for edge in list(state.edges.values()) + list(config.edges.values()):
+        src = remap.get(edge.source_node, edge.source_node)
+        dst = remap.get(edge.target_node, edge.target_node)
+        if src == dst:
+            continue
+        rel = edge.relationship_type.value
+        result.add_edge(edge.model_copy(update={"id": f"{src}->{dst}:{rel}", "source_node": src, "target_node": dst}))
+    return result

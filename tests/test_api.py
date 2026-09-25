@@ -70,3 +70,29 @@ def test_index_serves_ui(tmp_db_path, sample_tf_dir):
     resp = client.get("/")
     assert resp.status_code == 200
     assert b"FlowLens" in resp.content
+
+
+def test_get_paths_directed_and_undirected(tmp_db_path, sample_tf_dir):
+    client, _graph = _seeded_client(tmp_db_path, sample_tf_dir)
+    resp = client.get("/api/paths", params={"source": "aws_lb_listener.app", "target": "aws_vpc.main"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["found"] is True and data["directed"] is True
+    assert data["nodes"][0] == "tf:aws_lb_listener.app" and data["nodes"][-1] == "tf:aws_vpc.main"
+    assert len(data["hops"]) == len(data["edges"])
+
+    resp = client.get("/api/paths", params={"source": "aws_vpc.main", "target": "aws_lb_listener.app"})
+    assert resp.json()["found"] is False
+    resp = client.get("/api/paths", params={"source": "aws_vpc.main", "target": "aws_lb_listener.app", "directed": False})
+    assert resp.json()["found"] is True
+
+
+def test_get_paths_unknown_node(tmp_db_path, sample_tf_dir):
+    client, _graph = _seeded_client(tmp_db_path, sample_tf_dir)
+    assert client.get("/api/paths", params={"source": "nope", "target": "aws_vpc.main"}).status_code == 404
+
+
+def test_get_compare(tmp_db_path, sample_tf_dir):
+    client, graph = _seeded_client(tmp_db_path, sample_tf_dir)
+    data = client.get("/api/compare").json()
+    assert data["summary"]["TERRAFORM_ONLY"] == len(graph.nodes)

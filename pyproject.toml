@@ -17,8 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.14",
-    "moto>=5.0",
+    "moto[apigateway]>=5.0",
     "httpx>=0.27",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -36,3 +37,13 @@ flowlens = ["api/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# (str, Enum) is kept deliberately: StrEnum changes str()/format() of stored values.
+ignore = ["UP042"]

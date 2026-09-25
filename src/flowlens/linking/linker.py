@@ -13,7 +13,8 @@ config-only ingestion (no state/AWS data yet) still yields semantic edges.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from flowlens.ids import make_node_id
 from flowlens.models.graph import Edge, Graph, Node, RelationshipType, Source

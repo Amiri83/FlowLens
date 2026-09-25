@@ -1,10 +1,17 @@
-"""Read-only AWS runtime discovery.
+"""Read-only AWS runtime discovery orchestrator.
 
-Every AWS call in this module is a Describe*/List*/Get* call — nothing here
+Runs the per-service scanners in flowlens.aws.resources one resource type at
+a time. Every AWS call they make is a Describe*/List*/Get* call — nothing
 creates, modifies, or deletes anything. Uses the standard boto3 credential
 and region resolution chain (env vars, shared config/credentials files,
-instance profile, ...), so it works unmodified against real AWS or against
-LocalStack when AWS_ENDPOINT_URL (and friends) point at http://localhost:4566.
+named profiles, instance profile, ...), so it works unmodified against real
+AWS or against LocalStack when AWS_ENDPOINT_URL (or
+AWS_ENDPOINT_URL_<SERVICE>) points at http://localhost:4566.
+
+Partial permissions: if a scanner hits AccessDenied (or any other
+permission-class ClientError), the denial is logged and recorded in the
+ScanReport, that resource type is marked unresolved, and the scan carries on
+with the remaining resource types.
 
 Discovered attributes are normalized to the same attribute vocabulary the
 Terraform ingester uses (vpc_id, subnets, security_groups, ...) so that
@@ -12,431 +19,170 @@ flowlens.linking.linker's rule set works identically over both sources.
 """
 from __future__ import annotations
 
-import os
-import re
-from typing import Any, Optional
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
+from flowlens.aws.resources import SERVICE_MODULES
+from flowlens.aws.resources._common import client
 from flowlens.ids import make_node_id
 from flowlens.models.graph import Graph, Node, Source
 
-_ARN_PATTERN = re.compile(r"arn:aws[a-zA-Z0-9-]*:lambda:[^/:\s]+:[^/:\s]+:function:[^/:\s]+")
+log = logging.getLogger(__name__)
+
+#: ClientError codes that mean "you are not allowed to do this" rather than
+#: "this broke". Matching is case-insensitive.
+PERMISSION_ERROR_CODES = {
+    "accessdenied",
+    "accessdeniedexception",
+    "unauthorizedoperation",
+    "unauthorizedaccess",
+    "unauthorizedexception",
+    "authorizationerror",
+    "authfailure",
+    "forbidden",
+    "forbiddenexception",
+    "notauthorized",
+    "unrecognizedclientexception",
+    "invalidclienttokenid",
+    "expiredtoken",
+    "expiredtokenexception",
+    "optinrequired",
+}
+
+def is_permission_error(exc: BaseException) -> bool:
+    if isinstance(exc, NoCredentialsError):
+        return True
+    if isinstance(exc, ClientError):
+        error = exc.response.get("Error", {})
+        code = str(error.get("Code", "")).lower()
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return code in PERMISSION_ERROR_CODES or status == 403
+    return False
 
 
-def _endpoint_for(service: str) -> Optional[str]:
-    return os.environ.get(f"AWS_ENDPOINT_URL_{service.upper()}") or os.environ.get("AWS_ENDPOINT_URL")
+@dataclass
+class ScanReport:
+    """Summary of one discovery run."""
+
+    region: str | None = None
+    account_id: str | None = None
+    scanned: dict[str, int] = field(default_factory=dict)  # resource_type -> count
+    denied: dict[str, dict[str, Any]] = field(default_factory=dict)  # resource_type -> detail
+    errors: dict[str, str] = field(default_factory=dict)  # resource_type -> message
+
+    @property
+    def unresolved_resource_types(self) -> list[str]:
+        return sorted(set(self.denied) | set(self.errors))
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.denied or self.errors)
+
+    @property
+    def denied_permissions(self) -> list[str]:
+        return sorted({d["permission"] for d in self.denied.values() if d.get("permission")})
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "region": self.region,
+            "account_id": self.account_id,
+            "partial": self.partial,
+            "scanned": dict(sorted(self.scanned.items())),
+            "unresolved_resource_types": self.unresolved_resource_types,
+            "denied_permissions": self.denied_permissions,
+            "denied": dict(sorted(self.denied.items())),
+            "errors": dict(sorted(self.errors.items())),
+        }
 
 
 class AWSDiscoverer:
-    """Wraps boto3 clients for the MVP resource set and emits FlowLens Nodes
-    with actual_state populated. Call discover_all() for everything, or the
-    individual discover_* methods to scope discovery.
+    """Emits FlowLens Nodes (actual_state populated) for the supported
+    resource set. Call discover_all() for everything or discover(<type>) to
+    scope discovery to one resource type.
     """
 
-    def __init__(self, region: Optional[str] = None, session: Optional[boto3.Session] = None):
-        self.session = session or boto3.Session(region_name=region)
-        self.region = self.session.region_name
-        self.account_id: Optional[str] = None
+    def __init__(
+        self,
+        region: str | None = None,
+        session: boto3.Session | None = None,
+        profile: str | None = None,
+    ):
+        self.session = session or boto3.Session(profile_name=profile, region_name=region)
+        self.region = region or self.session.region_name
+        self.report = ScanReport(region=self.region)
+        self.account_id: str | None = None
         try:
-            sts = self._client("sts")
-            self.account_id = sts.get_caller_identity().get("Account")
-        except Exception:
-            self.account_id = None
+            self.account_id = client(self.session, "sts", self.region).get_caller_identity().get("Account")
+        except (ClientError, BotoCoreError) as exc:
+            log.warning("Could not resolve AWS account id via sts:GetCallerIdentity: %s", exc)
+        self.report.account_id = self.account_id
 
-    def _client(self, service: str):
-        return self.session.client(service, endpoint_url=_endpoint_for(service))
+        self.scanners: dict[str, tuple[str, Callable]] = {}
+        for module, iam_prefix in SERVICE_MODULES:
+            for resource_type, fn in module.RESOURCE_SCANNERS.items():
+                self.scanners[resource_type] = (iam_prefix, fn)
 
-    def _node(self, resource_type: str, cloud_id: str, name: str, actual_state: dict[str, Any], arn: Optional[str] = None) -> Node:
+    @property
+    def errors(self) -> list[str]:
+        """Flat, human-readable list of everything that went wrong."""
+        out = [f"{rtype}: access denied ({d['permission'] or d['code']})" for rtype, d in sorted(self.report.denied.items())]
+        out += [f"{rtype}: {msg}" for rtype, msg in sorted(self.report.errors.items())]
+        return out
+
+    def _to_node(self, item: dict[str, Any]) -> Node:
         return Node(
-            id=make_node_id(resource_type, cloud_id),
-            name=name or cloud_id,
-            resource_type=resource_type,
+            id=make_node_id(item["resource_type"], item["cloud_id"]),
+            name=item["name"],
+            resource_type=item["resource_type"],
             source=Source.AWS,
-            aws_arn=arn,
+            aws_arn=item.get("arn"),
             region=self.region,
             account_id=self.account_id,
-            actual_state=actual_state,
+            actual_state=item["actual_state"],
         )
 
-    @staticmethod
-    def _tag_name(tags: Optional[list[dict[str, str]]], fallback: str) -> str:
-        for t in tags or []:
-            if t.get("Key") == "Name":
-                return t.get("Value", fallback)
-        return fallback
-
-    # ---- networking ---------------------------------------------------
-
-    def discover_vpcs(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        nodes = []
-        for vpc in ec2.describe_vpcs().get("Vpcs", []):
-            nodes.append(
-                self._node(
-                    "vpc",
-                    vpc["VpcId"],
-                    self._tag_name(vpc.get("Tags"), vpc["VpcId"]),
-                    {"cidr_block": vpc.get("CidrBlock"), "is_default": vpc.get("IsDefault")},
-                )
-            )
-        return nodes
-
-    def discover_subnets(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        subnets = ec2.describe_subnets().get("Subnets", [])
-        route_table_by_subnet = self._subnet_route_table_map(ec2)
-        nodes = []
-        for sn in subnets:
-            sid = sn["SubnetId"]
-            nodes.append(
-                self._node(
-                    "subnet",
-                    sid,
-                    self._tag_name(sn.get("Tags"), sid),
-                    {
-                        "vpc_id": sn.get("VpcId"),
-                        "cidr_block": sn.get("CidrBlock"),
-                        "availability_zone": sn.get("AvailabilityZone"),
-                        "route_table_id": route_table_by_subnet.get(sid),
-                    },
-                )
-            )
-        return nodes
-
-    @staticmethod
-    def _subnet_route_table_map(ec2) -> dict[str, str]:
-        mapping: dict[str, str] = {}
-        for rt in ec2.describe_route_tables().get("RouteTables", []):
-            for assoc in rt.get("Associations", []):
-                sid = assoc.get("SubnetId")
-                if sid:
-                    mapping[sid] = rt["RouteTableId"]
-        return mapping
-
-    def discover_route_tables(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        nodes = []
-        for rt in ec2.describe_route_tables().get("RouteTables", []):
-            rtid = rt["RouteTableId"]
-            nodes.append(
-                self._node("route_table", rtid, self._tag_name(rt.get("Tags"), rtid), {"vpc_id": rt.get("VpcId")})
-            )
-            for i, route in enumerate(rt.get("Routes", [])):
-                dest = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock") or f"local-{i}"
-                route_id = f"{rtid}-{dest}"
-                nodes.append(
-                    self._node(
-                        "route",
-                        route_id,
-                        route_id,
-                        {
-                            "route_table_id": rtid,
-                            "destination_cidr_block": dest,
-                            "gateway_id": route.get("GatewayId") if str(route.get("GatewayId", "")).startswith("igw-") else None,
-                            "nat_gateway_id": route.get("NatGatewayId"),
-                        },
-                    )
-                )
-        return nodes
-
-    def discover_security_groups(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        nodes = []
-        for sg in ec2.describe_security_groups().get("SecurityGroups", []):
-            peer_ids = [
-                pair["GroupId"]
-                for perm in sg.get("IpPermissions", [])
-                for pair in perm.get("UserIdGroupPairs", [])
-                if pair.get("GroupId")
-            ]
-            nodes.append(
-                self._node(
-                    "security_group",
-                    sg["GroupId"],
-                    sg.get("GroupName", sg["GroupId"]),
-                    {"vpc_id": sg.get("VpcId"), "source_security_group_id": peer_ids or None},
-                )
-            )
-        return nodes
-
-    def discover_internet_gateways(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        nodes = []
-        for igw in ec2.describe_internet_gateways().get("InternetGateways", []):
-            attachments = igw.get("Attachments", [])
-            vpc_id = attachments[0]["VpcId"] if attachments else None
-            gid = igw["InternetGatewayId"]
-            nodes.append(self._node("internet_gateway", gid, self._tag_name(igw.get("Tags"), gid), {"vpc_id": vpc_id}))
-        return nodes
-
-    def discover_nat_gateways(self) -> list[Node]:
-        ec2 = self._client("ec2")
-        nodes = []
-        try:
-            gateways = ec2.describe_nat_gateways().get("NatGateways", [])
-        except Exception:
-            gateways = []
-        for nat in gateways:
-            nid = nat["NatGatewayId"]
-            nodes.append(
-                self._node("nat_gateway", nid, self._tag_name(nat.get("Tags"), nid), {"subnet_id": nat.get("SubnetId")})
-            )
-        return nodes
-
-    # ---- load balancing -------------------------------------------------
-
-    def discover_load_balancers(self) -> tuple[list[Node], list[Node], list[Node]]:
-        """Returns (albs_and_nlbs, listeners, listener_rules)."""
-        elbv2 = self._client("elbv2")
-        lb_nodes, listener_nodes, rule_nodes = [], [], []
-        for lb in elbv2.describe_load_balancers().get("LoadBalancers", []):
-            arn = lb["LoadBalancerArn"]
-            lb_nodes.append(
-                self._node(
-                    "alb",
-                    arn,
-                    lb.get("LoadBalancerName", arn),
-                    {
-                        "vpc_id": lb.get("VpcId"),
-                        "subnets": [az["SubnetId"] for az in lb.get("AvailabilityZones", [])],
-                        "security_groups": lb.get("SecurityGroups", []),
-                        "scheme": lb.get("Scheme"),
-                        "type": lb.get("Type"),
-                    },
-                    arn=arn,
-                )
-            )
-            for listener in elbv2.describe_listeners(LoadBalancerArn=arn).get("Listeners", []):
-                larn = listener["ListenerArn"]
-                default_actions = [
-                    {"target_group_arn": a["TargetGroupArn"]} for a in listener.get("DefaultActions", []) if a.get("TargetGroupArn")
-                ]
-                listener_nodes.append(
-                    self._node(
-                        "listener",
-                        larn,
-                        larn,
-                        {
-                            "load_balancer_arn": arn,
-                            "protocol": listener.get("Protocol"),
-                            "port": listener.get("Port"),
-                            "default_action": default_actions,
-                        },
-                        arn=larn,
-                    )
-                )
-                for rule in elbv2.describe_rules(ListenerArn=larn).get("Rules", []):
-                    rarn = rule["RuleArn"]
-                    actions = [
-                        {"target_group_arn": a["TargetGroupArn"]} for a in rule.get("Actions", []) if a.get("TargetGroupArn")
-                    ]
-                    rule_nodes.append(
-                        self._node("listener_rule", rarn, rarn, {"listener_arn": larn, "action": actions}, arn=rarn)
-                    )
-        return lb_nodes, listener_nodes, rule_nodes
-
-    def discover_target_groups(self) -> list[Node]:
-        elbv2 = self._client("elbv2")
-        nodes = []
-        for tg in elbv2.describe_target_groups().get("TargetGroups", []):
-            arn = tg["TargetGroupArn"]
-            nodes.append(
-                self._node(
-                    "target_group",
-                    arn,
-                    tg.get("TargetGroupName", arn),
-                    {"vpc_id": tg.get("VpcId"), "protocol": tg.get("Protocol"), "port": tg.get("Port")},
-                    arn=arn,
-                )
-            )
-        return nodes
-
-    # ---- compute ---------------------------------------------------------
-
-    def discover_ecs(self) -> tuple[list[Node], list[Node], list[Node]]:
-        """Returns (clusters, services, task_definitions)."""
-        ecs = self._client("ecs")
-        cluster_nodes, service_nodes, taskdef_nodes = [], [], []
-        cluster_arns = ecs.list_clusters().get("clusterArns", [])
-        if not cluster_arns:
-            return cluster_nodes, service_nodes, taskdef_nodes
-        clusters = ecs.describe_clusters(clusters=cluster_arns).get("clusters", [])
-        seen_taskdefs: set[str] = set()
-        for cluster in clusters:
-            carn = cluster["clusterArn"]
-            cluster_nodes.append(self._node("ecs_cluster", carn, cluster.get("clusterName", carn), {}, arn=carn))
-            service_arns = ecs.list_services(cluster=carn).get("serviceArns", [])
-            if not service_arns:
-                continue
-            services = ecs.describe_services(cluster=carn, services=service_arns).get("services", [])
-            for svc in services:
-                sarn = svc["serviceArn"]
-                taskdef_arn = svc.get("taskDefinition")
-                net_cfg = svc.get("networkConfiguration", {}).get("awsvpcConfiguration", {})
-                service_nodes.append(
-                    self._node(
-                        "ecs_service",
-                        sarn,
-                        svc.get("serviceName", sarn),
-                        {
-                            "cluster": carn,
-                            "task_definition": taskdef_arn,
-                            "load_balancer": [
-                                {"target_group_arn": lb["targetGroupArn"]}
-                                for lb in svc.get("loadBalancers", [])
-                                if lb.get("targetGroupArn")
-                            ],
-                            "network_configuration": [
-                                {
-                                    "subnets": net_cfg.get("subnets", []),
-                                    "security_groups": net_cfg.get("securityGroups", []),
-                                }
-                            ]
-                            if net_cfg
-                            else [],
-                            "desired_count": svc.get("desiredCount"),
-                            "running_count": svc.get("runningCount"),
-                        },
-                        arn=sarn,
-                    )
-                )
-                if taskdef_arn and taskdef_arn not in seen_taskdefs:
-                    seen_taskdefs.add(taskdef_arn)
-        for taskdef_arn in seen_taskdefs:
-            try:
-                td = ecs.describe_task_definition(taskDefinition=taskdef_arn).get("taskDefinition", {})
-            except Exception:
-                continue
-            taskdef_nodes.append(
-                self._node(
-                    "ecs_task_definition",
-                    taskdef_arn,
-                    td.get("family", taskdef_arn),
-                    {
-                        "cpu": td.get("cpu"),
-                        "memory": td.get("memory"),
-                        "container_definitions": [c.get("name") for c in td.get("containerDefinitions", [])],
-                    },
-                    arn=taskdef_arn,
-                )
-            )
-        return cluster_nodes, service_nodes, taskdef_nodes
-
-    # ---- serverless --------------------------------------------------------
-
-    def discover_lambda_functions(self) -> list[Node]:
-        lam = self._client("lambda")
-        nodes = []
-        for fn in lam.list_functions().get("Functions", []):
-            arn = fn["FunctionArn"]
-            vpc_config = fn.get("VpcConfig") or {}
-            nodes.append(
-                self._node(
-                    "lambda",
-                    arn,
-                    fn.get("FunctionName", arn),
-                    {
-                        "runtime": fn.get("Runtime"),
-                        "vpc_config": [
-                            {
-                                "subnet_ids": vpc_config.get("SubnetIds", []),
-                                "security_group_ids": vpc_config.get("SecurityGroupIds", []),
-                            }
-                        ]
-                        if vpc_config
-                        else [],
-                    },
-                    arn=arn,
-                )
-            )
-        return nodes
-
-    # ---- API Gateway (REST / v1) --------------------------------------------
-
-    def discover_api_gateways(self) -> tuple[list[Node], list[Node]]:
-        """Returns (rest_apis, integrations). Integrations carry an
-        `integration_uri` set to the bare Lambda ARN when the integration
-        targets a Lambda function, so the linker can resolve it.
+    def discover(self, resource_type: str) -> list[Node]:
+        """Scan one resource type. Never raises for AWS-side failures: those
+        are recorded in self.report and an empty list is returned.
         """
+        iam_prefix, fn = self.scanners[resource_type]
         try:
-            apigw = self._client("apigateway")
-        except Exception:
-            return [], []
-        api_nodes, integration_nodes = [], []
-        try:
-            apis = apigw.get_rest_apis().get("items", [])
-        except Exception:
-            return [], []
-        for api in apis:
-            api_id = api["id"]
-            api_nodes.append(self._node("api_gateway", api_id, api.get("name", api_id), {}))
-            try:
-                resources = apigw.get_resources(restApiId=api_id).get("items", [])
-            except Exception:
-                resources = []
-            for res in resources:
-                for method in (res.get("resourceMethods") or {}).keys():
-                    try:
-                        integration = apigw.get_integration(restApiId=api_id, resourceId=res["id"], httpMethod=method)
-                    except Exception:
-                        continue
-                    uri = integration.get("uri", "")
-                    match = _ARN_PATTERN.search(uri)
-                    integration_id = f"{api_id}-{res['id']}-{method}"
-                    integration_nodes.append(
-                        self._node(
-                            "api_gateway_integration",
-                            integration_id,
-                            integration_id,
-                            {
-                                "rest_api_id": api_id,
-                                "http_method": method,
-                                "integration_uri": match.group(0) if match else None,
-                            },
-                        )
-                    )
-        return api_nodes, integration_nodes
+            items = fn(self.session, self.region)
+        except Exception as exc:  # noqa: BLE001 - one broken resource type must not abort the scan
+            if is_permission_error(exc):
+                operation = getattr(exc, "operation_name", None)
+                code = exc.response.get("Error", {}).get("Code") if isinstance(exc, ClientError) else type(exc).__name__
+                permission = f"{iam_prefix}:{operation}" if operation else None
+                log.warning("Access denied scanning %s (%s); continuing without it", resource_type, permission or code)
+                self.report.denied[resource_type] = {"permission": permission, "code": code, "message": str(exc)}
+            else:
+                log.warning("Failed to scan %s: %s; continuing without it", resource_type, exc)
+                self.report.errors[resource_type] = str(exc)
+            return []
+        self.report.scanned[resource_type] = len(items)
+        return [self._to_node(item) for item in items]
 
     def discover_all(self) -> Graph:
-        """Run every discover_* method, tolerating individual failures (a
-        service unavailable on this AWS/LocalStack edition, missing IAM
-        permissions, etc.) so one broken service doesn't abort the whole run.
-        Returns the partial graph plus records what failed in `self.errors`.
+        """Scan every supported resource type, degrading gracefully. The
+        returned graph carries the scan summary in graph.metadata["aws_scan"],
+        and nodes of a partially scanned account are flagged in metadata.
         """
         graph = Graph()
-        self.errors: list[str] = []
-
-        def _run(label: str, fn) -> list[Node]:
-            try:
-                return fn()
-            except Exception as exc:  # noqa: BLE001 - discovery must degrade gracefully
-                self.errors.append(f"{label}: {exc}")
-                return []
-
-        simple_steps = [
-            ("vpcs", self.discover_vpcs),
-            ("subnets", self.discover_subnets),
-            ("route_tables", self.discover_route_tables),
-            ("security_groups", self.discover_security_groups),
-            ("internet_gateways", self.discover_internet_gateways),
-            ("nat_gateways", self.discover_nat_gateways),
-            ("target_groups", self.discover_target_groups),
-            ("lambda_functions", self.discover_lambda_functions),
-        ]
-        for label, fn in simple_steps:
-            for node in _run(label, fn):
+        for resource_type in self.scanners:
+            for node in self.discover(resource_type):
                 graph.add_node(node)
-
-        for node in _run("load_balancers", lambda: [n for group in self.discover_load_balancers() for n in group]):
-            graph.add_node(node)
-        for node in _run("ecs", lambda: [n for group in self.discover_ecs() for n in group]):
-            graph.add_node(node)
-        for node in _run("api_gateways", lambda: [n for group in self.discover_api_gateways() for n in group]):
-            graph.add_node(node)
-
+        report = self.report.to_dict()
+        graph.metadata["aws_scan"] = report
+        if self.report.partial:
+            for node in graph.nodes.values():
+                node.metadata["aws_scan_partial"] = True
         return graph
 
 
-def discover_all(region: Optional[str] = None) -> Graph:
-    return AWSDiscoverer(region=region).discover_all()
+def discover_all(region: str | None = None, profile: str | None = None) -> Graph:
+    return AWSDiscoverer(region=region, profile=profile).discover_all()

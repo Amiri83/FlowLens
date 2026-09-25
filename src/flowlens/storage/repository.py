@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Optional
 
 from flowlens.models.graph import Edge, Graph, Node
 from flowlens.storage.db import connect
+
+#: meta-table key holding Graph.metadata (e.g. the last AWS scan summary).
+GRAPH_METADATA_KEY = "graph_metadata"
 
 
 class GraphRepository:
@@ -79,10 +81,14 @@ class GraphRepository:
                     edge.source.value,
                 ),
             )
+        cur.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (GRAPH_METADATA_KEY, json.dumps(graph.metadata)),
+        )
         self.conn.commit()
 
     def load_graph(self) -> Graph:
-        graph = Graph()
+        graph = Graph(metadata=json.loads(self.get_meta(GRAPH_METADATA_KEY) or "{}"))
         for row in self.conn.execute("SELECT * FROM nodes"):
             graph.nodes[row["id"]] = Node(
                 id=row["id"],
@@ -117,6 +123,6 @@ class GraphRepository:
         self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         self.conn.commit()
 
-    def get_meta(self, key: str) -> Optional[str]:
+    def get_meta(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None

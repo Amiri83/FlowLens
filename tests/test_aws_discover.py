@@ -22,8 +22,8 @@ def test_discover_vpc_and_subnet():
     subnet = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24")["Subnet"]
 
     discoverer = AWSDiscoverer(region="us-east-1", session=boto3.Session(region_name="us-east-1"))
-    vpc_nodes = {n.id: n for n in discoverer.discover_vpcs()}
-    subnet_nodes = {n.id: n for n in discoverer.discover_subnets()}
+    vpc_nodes = {n.id: n for n in discoverer.discover("vpc")}
+    subnet_nodes = {n.id: n for n in discoverer.discover("subnet")}
 
     # moto seeds a default VPC per region, so only assert on the one we created.
     our_vpc = vpc_nodes[f"vpc:{vpc['VpcId']}"]
@@ -55,5 +55,5 @@ def test_discover_security_group_and_peer_reference():
     )
 
     discoverer = AWSDiscoverer(region="us-east-1", session=boto3.Session(region_name="us-east-1"))
-    sg_nodes = {n.id: n for n in discoverer.discover_security_groups()}
+    sg_nodes = {n.id: n for n in discoverer.discover("security_group")}
     assert sg_nodes[f"security_group:{sg2}"].actual_state["source_security_group_id"] == [sg1]

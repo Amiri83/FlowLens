@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -42,7 +42,7 @@ class RelationshipType(str, Enum):
     ASSOCIATED_WITH = "associated_with"
 
 
-def _compute_status(desired: Optional[dict[str, Any]], actual: Optional[dict[str, Any]]) -> ResourceStatus:
+def _compute_status(desired: dict[str, Any] | None, actual: dict[str, Any] | None) -> ResourceStatus:
     if desired is not None and actual is not None:
         return ResourceStatus.OK
     if desired is not None:
@@ -58,16 +58,16 @@ class Node(BaseModel):
     resource_type: str
     provider: str = "aws"
     source: Source = Source.MERGED
-    terraform_address: Optional[str] = None
-    aws_arn: Optional[str] = None
-    region: Optional[str] = None
-    account_id: Optional[str] = None
+    terraform_address: str | None = None
+    aws_arn: str | None = None
+    region: str | None = None
+    account_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    desired_state: Optional[dict[str, Any]] = None
-    actual_state: Optional[dict[str, Any]] = None
+    desired_state: dict[str, Any] | None = None
+    actual_state: dict[str, Any] | None = None
     status: ResourceStatus = ResourceStatus.UNKNOWN
 
-    def merge(self, other: "Node") -> "Node":
+    def merge(self, other: Node) -> Node:
         """Combine this node with another representation of the same resource.
 
         Used to reconcile a Terraform-sourced node with an AWS-discovered node
@@ -105,9 +105,9 @@ class Edge(BaseModel):
     source_node: str
     target_node: str
     relationship_type: RelationshipType
-    protocol: Optional[str] = None
-    port: Optional[int] = None
-    direction: Optional[str] = None
+    protocol: str | None = None
+    port: int | None = None
+    direction: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     source: Source = Source.MERGED
 
@@ -115,6 +115,8 @@ class Edge(BaseModel):
 class Graph(BaseModel):
     nodes: dict[str, Node] = Field(default_factory=dict)
     edges: dict[str, Edge] = Field(default_factory=dict)
+    #: Graph-level annotations, e.g. the last AWS scan summary.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     def add_node(self, node: Node) -> Node:
         """Insert a node, merging with any existing node sharing the same id.
@@ -135,7 +137,7 @@ class Graph(BaseModel):
         self.edges[edge.id] = edge
         return edge
 
-    def get_node(self, node_id: str) -> Optional[Node]:
+    def get_node(self, node_id: str) -> Node | None:
         return self.nodes.get(node_id)
 
     def neighbors(self, node_id: str) -> list[tuple[Edge, str]]:
@@ -151,7 +153,7 @@ class Graph(BaseModel):
     def edges_for(self, node_id: str) -> list[Edge]:
         return [e for e in self.edges.values() if e.source_node == node_id or e.target_node == node_id]
 
-    def find_path(self, start_id: str, end_id: str) -> Optional[list[str]]:
+    def find_path(self, start_id: str, end_id: str) -> list[str] | None:
         """Breadth-first shortest path between two node ids, treating edges as undirected.
 
         Returns a list of node ids from start to end (inclusive), or None if
@@ -181,20 +183,21 @@ class Graph(BaseModel):
         return {
             "nodes": [n.model_dump(mode="json") for n in self.nodes.values()],
             "edges": [e.model_dump(mode="json") for e in self.edges.values()],
+            "metadata": self.metadata,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Graph":
-        graph = cls()
+    def from_dict(cls, data: dict[str, Any]) -> Graph:
+        graph = cls(metadata=data.get("metadata") or {})
         for n in data.get("nodes", []):
             graph.add_node(Node.model_validate(n))
         for e in data.get("edges", []):
             graph.add_edge(Edge.model_validate(e))
         return graph
 
-    def merge(self, other: "Graph") -> "Graph":
+    def merge(self, other: Graph) -> Graph:
         """Merge another graph into a new graph, deduping nodes by id via Node.merge."""
-        result = Graph()
+        result = Graph(metadata={**self.metadata, **other.metadata})
         for node in self.nodes.values():
             result.add_node(node)
         for node in other.nodes.values():

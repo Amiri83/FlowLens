@@ -441,7 +441,12 @@ class ReachabilityEngine:
         a_ext = a.external or not a.in_vpc
         b_ext = b.external or not b.in_vpc
         if a_ext and b_ext:
-            add("route", NA, "both ends are outside any VPC; nothing FlowLens models lies between them")
+            if a.kind == "lambda" and b.external and not a.in_vpc:
+                add("route", A, f"{a.display} is not attached to a VPC; it runs in the AWS-managed Lambda network, which has "
+                                "internet egress", [f"{a.label}: no vpc_config"], resources=[a.node_id])
+            else:
+                add("route", U, "both ends are outside every known VPC; the network between them is not modelled",
+                    suggestion="Choose a source or destination inside a scanned VPC.")
             return checks
         if a_ext:
             checks.extend(self._inbound_from_outside(step, hop, protocol))

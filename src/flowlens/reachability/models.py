@@ -27,9 +27,12 @@ class CheckStatus(str, Enum):
 
 def combine(statuses) -> CheckStatus:
     """Conjunction of required checks: any BLOCKED -> BLOCKED, else any
-    UNKNOWN -> UNKNOWN, else ALLOWED. NOT_APPLICABLE checks are ignored.
+    UNKNOWN -> UNKNOWN, else ALLOWED. NOT_APPLICABLE checks are ignored;
+    if nothing was actually proven, the result is UNKNOWN (never ALLOWED).
     """
     seen = {s for s in statuses if s != CheckStatus.NOT_APPLICABLE}
+    if not seen:
+        return CheckStatus.UNKNOWN
     if CheckStatus.BLOCKED in seen:
         return CheckStatus.BLOCKED
     if CheckStatus.UNKNOWN in seen:

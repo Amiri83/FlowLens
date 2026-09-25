@@ -334,3 +334,18 @@ def test_evidence_is_retained_on_result():
     assert any("rtb-pub" in e and "igw-1" in e for e in data["evidence"])
     assert all({"check_type", "status", "evidence", "reason"} <= c.keys() for c in data["checks"])
     assert {s["classification"] for s in data["subnets"]} == {"PUBLIC", "PRIVATE"}
+
+
+def test_nothing_proven_is_unknown_never_allowed():
+    # Two addresses outside every known VPC: no check can prove anything.
+    result = ReachabilityEngine(Stack().build()).analyze("internet", "203.0.113.7", "tcp", 443)
+    assert result.overall_status == U
+    from flowlens.reachability.models import combine
+
+    assert combine([NA, NA]) == U and combine([]) == U and combine([A, NA]) == A
+
+
+def test_private_address_inside_vpc_has_unknown_security_groups():
+    result = ReachabilityEngine(Stack().build()).analyze(f"alb:{ALB_ARN}", "10.0.2.9", "tcp", 8080)
+    assert result.overall_status == U
+    assert check(result, "security_group_ingress").status == U

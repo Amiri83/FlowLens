@@ -13,12 +13,20 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from flowlens.compare.diff import compare_graph, summarize
 from flowlens.graph.traversal import resolve_node_ref, shortest_path
 from flowlens.storage.repository import GraphRepository
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+class ReachabilityRequest(BaseModel):
+    source: str
+    destination: str
+    protocol: str = "tcp"
+    port: str | int | None = None
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -97,6 +105,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if result is None:
             return {"found": False, "source": src, "target": dst, "directed": directed, "nodes": [], "edges": [], "hops": []}
         return {"source": src, "target": dst, "directed": directed, **result.to_dict()}
+
+    @app.get("/api/reachability/endpoints")
+    def get_reachability_endpoints():
+        """Resources usable as reachability source/destination (plus 'internet')."""
+        from flowlens.reachability.facts import build_facts
+
+        facts = build_facts(_load())
+        endpoints = [{"id": "internet", "label": "Internet (0.0.0.0/0)", "kind": "internet"}]
+        endpoints += sorted(
+            ({"id": ep.node_id, "label": ep.display, "kind": ep.kind} for ep in facts.endpoints.values() if ep.node_id),
+            key=lambda e: (e["kind"], e["label"]),
+        )
+        return {"endpoints": endpoints}
+
+    @app.post("/api/reachability")
+    def post_reachability(request: ReachabilityRequest):
+        """Deterministic reachability analysis (routes, NACLs, security groups,
+        load balancer port transitions). Never mutates anything.
+        """
+        from flowlens.reachability import EndpointError, ReachabilityEngine
+
+        try:
+            result = ReachabilityEngine(_load()).analyze(request.source, request.destination, request.protocol, request.port)
+        except (EndpointError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result.to_dict()
 
     @app.get("/api/compare")
     def get_compare():

@@ -194,7 +194,7 @@ class ReachabilityEngine:
             label = f"{ep.display} ({', '.join(str(a) for a in addrs)})" if ep.kind != "address" else ep.display
         else:
             label = ep.display
-        return sg_eval.Peer(label, addrs, list(ep.sgs), bool(ep.sgs_unresolved), ep.display)
+        return sg_eval.Peer(label, addrs, list(ep.sgs), bool(ep.sgs_unresolved), ep.display, internet=ep.kind == "internet")
 
     # --- candidate enumeration --------------------------------------------------
 
@@ -664,25 +664,26 @@ class ReachabilityEngine:
             return [self._check("nacl", NA, a.display, b.display,
                                 "source and destination share the subnet; network ACLs only apply at subnet boundaries", hop=hop)]
 
-        def run(leg, subnet, direction, ports, peer, partial):
+        def run(leg, subnet, direction, ports, peer, partial, peer_ep):
             nacl_key, how = self.facts.effective_nacl(subnet)
             acl = self.facts.nacls.get(nacl_key or "")
             resources.extend([subnet, nacl_key])
             if acl is None:
                 legs[leg].append((U, [f"{self.facts.label(subnet)}: {how}"], "no NACL data"))
                 return
-            v = nacl_eval.evaluate(acl, direction, protocol, ports, peer, partial_is_unknown=partial)
+            v = nacl_eval.evaluate(acl, direction, protocol, ports, peer, partial_is_unknown=partial,
+                                   peer_is_internet=peer_ep.kind == "internet")
             if not acl.complete and v.status == B:
                 v.status = U
             legs[leg].append((v.status, [f"{self.facts.label(subnet)} uses {acl.label} ({how})"] + v.evidence, v.detail))
 
         for sa, aa, sb, ab in crossing:
             if sa is not None:
-                run("nacl_egress", sa, "egress", required, ab, False)
-                run("nacl_return_ingress", sa, "ingress", reply, ab, True)
+                run("nacl_egress", sa, "egress", required, ab, False, b)
+                run("nacl_return_ingress", sa, "ingress", reply, ab, True, b)
             if sb is not None:
-                run("nacl_ingress", sb, "ingress", required, aa, False)
-                run("nacl_return_egress", sb, "egress", reply, aa, True)
+                run("nacl_ingress", sb, "ingress", required, aa, False, a)
+                run("nacl_return_egress", sb, "egress", reply, aa, True, a)
         texts = {
             "nacl_egress": (a, b, f"{a.display} subnet NACL egress {fmt_traffic(protocol, step.port)} to {b.display}"),
             "nacl_ingress": (a, b, f"{b.display} subnet NACL ingress {fmt_traffic(protocol, step.port)} from {a.display}"),

@@ -28,6 +28,7 @@ from flowlens.reachability.netutil import (
     fmt_intervals,
     fmt_traffic,
     has_ports,
+    is_private,
     merge,
     subtract,
 )
@@ -42,6 +43,9 @@ class Peer:
     sgs: list[str] = field(default_factory=list)
     sgs_unknown: bool = False
     name: str = ""
+    #: The generic Internet: public address space only, so rules for
+    #: private (RFC 1918 etc.) ranges cannot match it.
+    internet: bool = False
 
 
 @dataclass
@@ -87,6 +91,8 @@ def _peer_match(rule: SGRule, owner: str, peer: Peer, facet: IPNetwork | None, w
         result = "maybe"
         why.append(f"security groups of {peer.name or peer.label} are unknown, so SG-referencing rules cannot be matched")
     for cidr in rule.cidrs:
+        if peer.internet and cidr.prefixlen > 0 and is_private(cidr):
+            continue
         if facet is None:
             if cidr.prefixlen == 0:
                 return "yes"

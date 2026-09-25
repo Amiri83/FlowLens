@@ -25,6 +25,7 @@ from flowlens.reachability.netutil import (
     cidr_relation,
     fmt_intervals,
     intersect,
+    is_private,
     merge,
     subtract,
 )
@@ -56,6 +57,7 @@ def evaluate(
     peer: IPNetwork | None,
     *,
     partial_is_unknown: bool = False,
+    peer_is_internet: bool = False,
 ) -> NaclVerdict:
     """Evaluate one direction of one NACL for traffic to/from `peer`.
 
@@ -64,6 +66,8 @@ def evaluate(
     partial_is_unknown: for reply traffic to an unknown ephemeral port, a
     NACL that allows only part of the range is UNKNOWN (depends on the
     client OS), not BLOCKED.
+    peer_is_internet: the peer is the generic Internet (public addresses
+    only), so rules for private ranges never match it.
     """
     port_unknown = required is None
     wanted = [ALL_PORTS] if port_unknown else merge(required)
@@ -93,7 +97,7 @@ def evaluate(
         relation = "covers" if peer is None and rule.cidr.prefixlen == 0 else (
             "overlaps" if peer is None else cidr_relation(rule.cidr, peer)
         )
-        if relation == "disjoint":
+        if relation == "disjoint" or (peer_is_internet and rule.cidr.prefixlen > 0 and is_private(rule.cidr)):
             continue
         if relation == "overlaps":
             ambiguous.append((hit, rule.action))

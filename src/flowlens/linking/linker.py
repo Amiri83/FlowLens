@@ -65,6 +65,11 @@ class _Resolver:
         return found
 
 
+#: Public name for reuse (e.g. by flowlens.reachability) without duplicating
+#: the id/ARN/Terraform-address resolution rules.
+Resolver = _Resolver
+
+
 def _edge(src: str, dst: str, rel: RelationshipType, *, protocol: str | None = None,
           port: int | None = None, metadata: dict[str, Any] | None = None) -> Edge:
     return Edge(

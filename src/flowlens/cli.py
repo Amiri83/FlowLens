@@ -204,6 +204,38 @@ def path_cmd(
         console.print(f"    [cyan]{arrow}[/cyan] {step.to_node}  [dim]({graph.nodes[step.to_node].resource_type})[/dim]")
 
 
+@app.command("reachability")
+def reachability_cmd(
+    source: str = typer.Argument(..., help="'internet', an IP/CIDR, or a resource (id, terraform address, ARN, cloud id, name)"),
+    destination: str = typer.Argument(..., help="'internet', an IP/CIDR, or a resource (id, terraform address, ARN, cloud id, name)"),
+    protocol: str = typer.Option("tcp", "--protocol", "-p", help="tcp | udp | icmp | icmpv6 | -1 (all traffic)"),
+    port: str | None = typer.Option(None, "--port", help="Destination port or range, e.g. 443 or 8000-8100 (ICMP: type)"),
+    as_json: bool = typer.Option(False, "--json", help="Print the full result (checks + evidence) as JSON"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show every evidence line"),
+    db: str = typer.Option(DEFAULT_DB, help="SQLite database path"),
+):
+    """Can traffic flow from SOURCE to DESTINATION on protocol/port? Where is it blocked and why?
+
+    Evaluates routes (longest-prefix match), network ACLs (stateless), security groups (stateful)
+    and load balancer port transitions. Result is ALLOWED, BLOCKED or UNKNOWN (never guessed).
+    Unlike `flowlens path`, graph connectivity is not treated as reachability.
+    """
+    from flowlens.reachability import EndpointError, ReachabilityEngine
+    from flowlens.reachability.render import render_text
+
+    graph = _load(db)
+    try:
+        result = ReachabilityEngine(graph).analyze(source, destination, protocol, port)
+    except (EndpointError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        console.print_json(json.dumps(result.to_dict(), default=str))
+        return
+    # Plain print: output must stay readable without color or markup.
+    typer.echo(render_text(result, verbose=verbose))
+
+
 @app.command("info")
 def info(
     resource: str = typer.Argument(..., help="Node id, terraform address, ARN, cloud id, or name"),

@@ -69,10 +69,14 @@ def split_graph(graph: Graph) -> tuple[list[Node], list[Node]]:
     """Split a stored (possibly merged) graph into desired and actual views.
 
     A MERGED node that carries both desired_state and actual_state appears on
-    both sides (it will then match itself by node id).
+    both sides (it will then match itself by node id). Terraform `data`
+    sources and `module` calls are not managed resources, so they are never
+    expected to exist in AWS and are left out of the desired side.
     """
     desired, actual = [], []
     for node in sorted(graph.nodes.values(), key=lambda n: n.id):
+        if node.metadata.get("terraform_mode") in ("data", "module"):
+            continue
         if node.desired_state is not None or node.source == Source.TERRAFORM:
             desired.append(node.model_copy(update={"source": Source.TERRAFORM, "actual_state": None}))
         if node.actual_state is not None or node.source == Source.AWS:

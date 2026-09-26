@@ -8,6 +8,8 @@ us at a `.tf` config directory / `terraform.tfstate` file) themselves.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -18,7 +20,23 @@ import hcl2
 from flowlens.ids import make_node_id, make_tf_only_node_id, normalize_terraform_type
 from flowlens.models.graph import Edge, Graph, Node, RelationshipType, Source
 
-_REF_PATTERN = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_-]*)")
+logger = logging.getLogger(__name__)
+
+#: A Terraform reference: `data.<type>.<name>`, `module.<name>` or
+#: `<type>.<name>`. The special prefixes are tried first so e.g.
+#: "data.aws_ami.ubuntu.id" yields "data.aws_ami.ubuntu" rather than
+#: "data.aws_ami". The lookbehind stops matches mid-way through an attribute
+#: chain (e.g. the "network.vpc_id" in "module.network.vpc_id").
+_REF_PATTERN = re.compile(
+    r"(?<![\w.])(data\.[a-zA-Z_][a-zA-Z0-9_-]*\.[a-zA-Z_][a-zA-Z0-9_-]*"
+    r"|module\.[a-zA-Z_][a-zA-Z0-9_-]*"
+    r"|[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_-]*)"
+)
+
+#: Directories never scanned for .tf files: Terraform/Terragrunt caches
+#: (downloaded module/provider copies, not the user's config) and VCS/tooling
+#: dirs.
+_SKIP_DIRS = frozenset({".terraform", ".terragrunt-cache", ".git", ".hg", ".svn", ".venv", "node_modules", "__pycache__"})
 
 
 def _unquote(s: str) -> str:
@@ -80,7 +98,7 @@ def _find_references(value: Any, address_set: set[str], exclude: str) -> set[str
     def walk(v: Any) -> None:
         if isinstance(v, str):
             for match in _REF_PATTERN.finditer(v):
-                candidate = f"{match.group(1)}.{match.group(2)}"
+                candidate = match.group(1)
                 if candidate in address_set and candidate != exclude:
                     found.add(candidate)
         elif isinstance(v, dict):
@@ -111,50 +129,101 @@ def _add_depends_on_edges(graph: Graph, src_id: str, refs: Iterable[str], id_by_
         )
 
 
-def parse_config_dir(dir_path: Path, files: list[Path] | None = None) -> Graph:
-    """Parse a directory of .tf files into a Graph of desired-state nodes.
-
-    Resource attribute values become `desired_state`. Generic `depends_on`
-    edges are derived from interpolation references between resources;
-    semantic edges (contains, forwards_to, ...) are added later by
-    flowlens.linking.linker.
+def discover_tf_files(dir_path: Path) -> list[Path]:
+    """Recursively find `.tf` files under `dir_path`, in a deterministic
+    (sorted) order, skipping Terraform/Terragrunt caches and VCS dirs.
     """
-    graph = Graph()
-    tf_files = files if files is not None else sorted(dir_path.glob("*.tf"))
+    found: list[Path] = []
+    for root, dirs, files in os.walk(dir_path):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        found.extend(Path(root) / f for f in files if f.endswith(".tf"))
+    return sorted(found)
 
-    resources: dict[str, tuple[str, str, dict[str, Any]]] = {}
-    for tf_file in tf_files:
-        with open(tf_file) as f:
-            parsed = hcl2.load(f)
-        for resource_block in parsed.get("resource", []):
-            for raw_type, named in resource_block.items():
+
+#: (mode, terraform type or None for modules, name, normalized body, source file)
+_Block = tuple[str, str | None, str, dict[str, Any], str]
+
+
+def _blocks_in(parsed: dict[str, Any], rel_file: str) -> Iterable[tuple[str, _Block]]:
+    """Yield (address, block) for every resource, data and module block."""
+    for mode, prefix in (("managed", ""), ("data", "data.")):
+        for block in parsed.get("resource" if mode == "managed" else "data", []):
+            for raw_type, named in block.items():
                 tf_type = _unquote(raw_type)
                 for raw_name, body in named.items():
                     name = _unquote(raw_name)
-                    address = f"{tf_type}.{name}"
-                    resources[address] = (tf_type, name, _normalize(body))
+                    yield f"{prefix}{tf_type}.{name}", (mode, tf_type, name, _normalize(body), rel_file)
+    for block in parsed.get("module", []):
+        for raw_name, body in block.items():
+            name = _unquote(raw_name)
+            yield f"module.{name}", ("module", None, name, _normalize(body), rel_file)
+
+
+def parse_config_dir(dir_path: Path, files: list[Path] | None = None) -> Graph:
+    """Parse a directory tree of .tf files into a Graph of desired-state nodes.
+
+    `.tf` files are discovered recursively (see discover_tf_files). Managed
+    `resource` blocks, `data` sources and `module` calls each become a node
+    addressed as in Terraform (`aws_vpc.main`, `data.aws_ami.x`,
+    `module.network`); child-module sources are not resolved. `count` /
+    `for_each` resources yield one node for the base address.
+
+    Resource attribute values become `desired_state`. Generic `depends_on`
+    edges are derived from interpolation references (and explicit
+    `depends_on` lists) between blocks; semantic edges (contains,
+    forwards_to, ...) are added later by flowlens.linking.linker.
+
+    A file that fails to parse is skipped and reported in
+    `graph.metadata["terraform_scan"]["warnings"]` rather than aborting.
+    """
+    graph = Graph()
+    tf_files = files if files is not None else discover_tf_files(dir_path)
+
+    warnings: list[str] = []
+    blocks: dict[str, _Block] = {}
+    for tf_file in tf_files:
+        rel_file = tf_file.relative_to(dir_path).as_posix() if tf_file.is_relative_to(dir_path) else str(tf_file)
+        try:
+            with open(tf_file) as f:
+                parsed = hcl2.load(f)
+        except Exception as exc:  # any parser failure must only skip this file
+            message = " ".join(str(exc).split()) or type(exc).__name__
+            warnings.append(f"{rel_file}: failed to parse, skipped ({type(exc).__name__}: {message})")
+            logger.info("Skipping unparseable Terraform file %s: %s", tf_file, message)
+            continue
+        for address, block in _blocks_in(parsed, rel_file):
+            if address in blocks:
+                warnings.append(f"{rel_file}: duplicate address {address} (already defined in {blocks[address][4]}); kept the first")
+                continue
+            blocks[address] = block
 
     id_by_address: dict[str, str] = {}
-    for address, (tf_type, name, body) in resources.items():
+    for address, (mode, tf_type, name, body, rel_file) in blocks.items():
         node_id = make_tf_only_node_id(address)
         id_by_address[address] = node_id
+        metadata: dict[str, Any] = {"terraform_mode": mode, "terraform_file": rel_file}
+        if tf_type is not None:
+            metadata["terraform_type"] = tf_type
+        elif isinstance(body.get("source"), str):
+            metadata["module_source"] = body["source"]
         graph.add_node(
             Node(
                 id=node_id,
                 name=_resource_name(body, name),
-                resource_type=normalize_terraform_type(tf_type),
+                resource_type=normalize_terraform_type(tf_type) if tf_type is not None else "module",
                 source=Source.TERRAFORM,
                 terraform_address=address,
-                metadata={"terraform_type": tf_type},
+                metadata=metadata,
                 desired_state=body,
             )
         )
 
-    address_set = set(resources.keys())
-    for address, (_tf_type, _name, body) in resources.items():
+    address_set = set(blocks.keys())
+    for address, (_mode, _tf_type, _name, body, _file) in blocks.items():
         refs = _find_references(body, address_set, exclude=address)
         _add_depends_on_edges(graph, id_by_address[address], refs, id_by_address)
 
+    graph.metadata["terraform_scan"] = {"files_scanned": len(tf_files), "warnings": warnings}
     return graph
 
 

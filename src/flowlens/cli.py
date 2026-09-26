@@ -8,6 +8,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from flowlens.graph.traversal import resolve_node_ref, shortest_path
@@ -65,6 +66,14 @@ def _resolve_or_exit(graph: Graph, ref: str) -> str:
     return node_id
 
 
+def _print_tf_scan_warnings(graph: Graph) -> None:
+    warnings = (graph.metadata.get("terraform_scan") or {}).get("warnings") or []
+    if warnings:
+        console.print(f"[yellow]{len(warnings)} Terraform warning(s) — affected files/blocks were skipped, the rest was scanned:[/yellow]")
+        for w in warnings:
+            console.print(f"  [yellow]-[/yellow] {escape(w)}")
+
+
 @app.command("ingest-tf")
 def ingest_tf(
     path: str = typer.Argument(..., help="Directory of .tf files, a single .tf file, terraform.tfstate, or `terraform show -json` output"),
@@ -73,6 +82,7 @@ def ingest_tf(
     """Parse Terraform config/state/plan and merge into the stored graph as desired-state nodes."""
     console.print(f"[cyan]Ingesting Terraform from[/cyan] {path}")
     graph = ingest_path(path)
+    _print_tf_scan_warnings(graph)
     merged = _merge_and_save(graph, db)
     console.print(f"[green]Ingested[/green] {len(graph.nodes)} nodes, {len(graph.edges)} edges from Terraform.")
     _summary(merged)
@@ -88,6 +98,7 @@ def scan(
     """Scan Terraform (desired state) into the graph: ingest + link in one step."""
     console.print(f"[cyan]Scanning Terraform[/cyan] {path}" + (f" with state {state}" if state else ""))
     graph = ingest_path(path)
+    _print_tf_scan_warnings(graph)
     if state:
         graph = combine_config_and_state(graph, ingest_path(state))
     merged = _merge_and_save(graph, db, link=link)

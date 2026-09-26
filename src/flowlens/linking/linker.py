@@ -9,14 +9,17 @@ both sources.
 Also resolves unresolved Terraform interpolation strings (e.g.
 "${aws_vpc.main.id}") against other resources' terraform_address, so
 config-only ingestion (no state/AWS data yet) still yields semantic edges.
+Such references are relative to the module instance of the node they
+appear in (see Resolver.for_node).
 """
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Callable
 from typing import Any
 
-from flowlens.ids import make_node_id
+from flowlens.ids import make_node_id, terraform_module_scope
 from flowlens.models.graph import Edge, Graph, Node, RelationshipType, Source
 
 _REF_PATTERN = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_-]*)")
@@ -35,14 +38,28 @@ class _Resolver:
     """Resolves an attribute value (a raw cloud id, an ARN, an HCL
     interpolation string, or a list of any of those) to node ids already
     present in the graph.
+
+    Interpolation references are resolved in `scope`, the module-instance
+    path of the node holding the value (see for_node): "aws_vpc.main"
+    inside module.api only ever means "module.api.aws_vpc.main", never a
+    same-named resource in the root or another module instance.
     """
 
     def __init__(self, graph: Graph):
         self.graph = graph
+        self.scope = ""
         self.by_address: dict[str, str] = {
             n.terraform_address: n.id for n in graph.nodes.values() if n.terraform_address
         }
         self.by_arn: dict[str, str] = {n.aws_arn: n.id for n in graph.nodes.values() if n.aws_arn}
+
+    def for_node(self, node: Node) -> _Resolver:
+        """A view of this resolver (sharing its indexes) that resolves
+        references relative to `node`'s Terraform module instance.
+        """
+        view = copy.copy(self)
+        view.scope = terraform_module_scope(node.terraform_address)
+        return view
 
     def resolve(self, value: Any, expected_type: str) -> list[str]:
         if isinstance(value, list):
@@ -59,7 +76,7 @@ class _Resolver:
             return [candidate_id]
         found = []
         for match in _REF_PATTERN.finditer(value):
-            address = f"{match.group(1)}.{match.group(2)}"
+            address = f"{self.scope}{match.group(1)}.{match.group(2)}"
             if address in self.by_address:
                 found.append(self.by_address[address])
         return found
@@ -276,6 +293,6 @@ def link_graph(graph: Graph) -> Graph:
         if handler is None:
             continue
         state = _state_of(node)
-        for edge in handler(node, state, resolver):
+        for edge in handler(node, state, resolver.for_node(node)):
             graph.add_edge(edge)
     return graph

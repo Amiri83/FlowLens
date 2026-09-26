@@ -7,6 +7,7 @@ Node id shape: "<normalized_type>:<cloud_id>", e.g. "vpc:vpc-0abc123".
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -77,3 +78,24 @@ def make_node_id(resource_type: str, cloud_id: str) -> str:
 def make_tf_only_node_id(terraform_address: str) -> str:
     """Fallback id for config-only resources that have no known cloud id yet."""
     return f"tf:{terraform_address}"
+
+
+#: Leading module path of a Terraform address: zero or more
+#: `module.<name>` steps, each optionally with an instance key (`[0]`,
+#: `["a.b"]`), each followed by a dot.
+_MODULE_PATH = re.compile(r'^(?:module\.[A-Za-z_][A-Za-z0-9_-]*(?:\[(?:"[^"]*"|[^\]]*)\])?\.)*')
+
+
+def terraform_module_scope(terraform_address: str | None) -> str:
+    """The module scope an address lives in, as a prefix ending in "." —
+    "" for the root module. References written inside that module
+    (`aws_security_group.this`) are relative to it:
+
+        "aws_instance.web"                            -> ""
+        "module.a.module.b.aws_lambda_function.this"  -> "module.a.module.b."
+        'module.w["x"].aws_lambda_function.this'      -> 'module.w["x"].'
+        "module.a" (the module call itself)           -> "" (its caller)
+    """
+    if not terraform_address:
+        return ""
+    return _MODULE_PATH.match(terraform_address).group(0)

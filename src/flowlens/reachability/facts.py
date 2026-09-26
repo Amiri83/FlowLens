@@ -371,13 +371,20 @@ class NetworkFacts:
 class _Builder:
     def __init__(self, graph: Graph):
         self.graph = graph
-        self.resolver = Resolver(graph)
+        self.base_resolver = Resolver(graph)
+        #: Resolves relative to the module instance of the node being
+        #: handled (see enter); references never cross module instances.
+        self.resolver = self.base_resolver
         self.facts = NetworkFacts(graph=graph, labels={nid: node_label(n) for nid, n in graph.nodes.items()})
         self.pending_sg_rules: list[tuple[str, SGRule]] = []
         self.pending_nacl_rules: list[tuple[str, str, NaclRule]] = []
         self.pending_rules: list[tuple[Node, dict[str, Any]]] = []
 
     # resolution ---------------------------------------------------------------
+
+    def enter(self, node: Node) -> None:
+        """Resolve subsequent references from `node`'s point of view."""
+        self.resolver = self.base_resolver.for_node(node)
 
     def refs(self, value, types: tuple[str, ...]) -> tuple[list[str], list[str]]:
         """Resolve an id/ARN/interpolation (or list of them) to node ids.
@@ -534,11 +541,13 @@ class _Builder:
             state, source = _state(node)
             handler = getattr(self, f"_h_{node.resource_type}", None)
             if handler is not None and node.resource_type in ("vpc", "vpc_ipv4_cidr_block_association", "subnet"):
+                self.enter(node)
                 handler(node, state, source)
         for node in nodes:
             state, source = _state(node)
             handler = getattr(self, f"_h_{node.resource_type}", None)
             if handler is not None and node.resource_type not in ("vpc", "vpc_ipv4_cidr_block_association", "subnet"):
+                self.enter(node)
                 handler(node, state, source)
         self._finish()
         return self.facts
@@ -886,7 +895,9 @@ class _Builder:
             ep.subnets_unresolved.append(f"db_subnet_group_name={state.get('db_subnet_group_name')!r}")
         else:
             gstate, _ = _state(group_node)
+            self.enter(group_node)
             ep.subnets, ep.subnets_unresolved = self.refs(gstate.get("subnet_ids"), ("subnet",))
+            self.enter(node)
         publicly = _bool(state.get("publicly_accessible"))
         ep.public_ip = bool(publicly) if publicly is not None or source == "terraform" else None
         ep.public_ip_evidence = f"{label} publicly_accessible = {str(bool(publicly)).lower()}"
@@ -923,6 +934,7 @@ class _Builder:
                         Route(cidr, str(cidr), "local", "local", "local", origin=f"{rt.label} implicit VPC local route", implicit=True)
                     )
         for node, state in self.pending_rules:
+            self.enter(node)
             label = facts.label(node.id)
             listener = facts.listeners.get(self.ref1(state.get("listener_arn"), ("listener",)) or "")
             if listener is None:

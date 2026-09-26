@@ -70,16 +70,38 @@ class _Resolver:
 Resolver = _Resolver
 
 
+def _coerce_port(value: Any) -> int | None:
+    """Return `value` as an int port if it safely is one (an int, an
+    integral float, or a numeric string like "8080"), else None. Dynamic
+    HCL expressions such as "${tonumber(each.key)}" yield None.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _edge(src: str, dst: str, rel: RelationshipType, *, protocol: str | None = None,
-          port: int | None = None, metadata: dict[str, Any] | None = None) -> Edge:
+          port: Any = None, metadata: dict[str, Any] | None = None) -> Edge:
+    metadata = dict(metadata or {})
+    coerced_port = _coerce_port(port)
+    if port is not None and coerced_port is None:
+        # Not a concrete integer (e.g. an unresolved HCL expression): keep
+        # the edge, drop the port, and preserve the raw value.
+        metadata["port_raw"] = port
     return Edge(
         id=f"{src}->{dst}:{rel.value}",
         source_node=src,
         target_node=dst,
         relationship_type=rel,
         protocol=protocol,
-        port=port,
-        metadata=metadata or {},
+        port=coerced_port,
+        metadata=metadata,
         source=Source.MERGED,
     )
 

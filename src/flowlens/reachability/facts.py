@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from flowlens.ids import make_node_id
-from flowlens.linking.linker import Resolver
+from flowlens.linking.linker import LOAD_BALANCER_TYPES, Resolver
 from flowlens.models.graph import Graph, Node
 from flowlens.reachability.netutil import (
     Interval,
@@ -746,6 +746,8 @@ class _Builder:
             ep.notes.append(f"{ep.label}: {lb_type} load balancer has no security groups; SG checks do not apply to it")
         self.facts.endpoints[node.id] = ep
 
+    _h_nlb = _h_alb  # same endpoint model; lb_type drives the NLB-specific rules
+
     def _forwards(self, actions, origin: str) -> tuple[list[Forward], list[str], bool]:
         blocks = _blocks(actions)
         if blocks is None:
@@ -772,7 +774,7 @@ class _Builder:
 
     def _h_listener(self, node: Node, state: dict, source: str) -> None:
         label = self.facts.label(node.id)
-        lb = self.ref1(state.get("load_balancer_arn"), ("alb",))
+        lb = self.ref1(state.get("load_balancer_arn"), LOAD_BALANCER_TYPES)
         forwards, types, known = self._forwards(state.get("default_action"), f"{label} default")
         if state.get("default_action_types"):
             types = [str(t) for t in state["default_action_types"]]

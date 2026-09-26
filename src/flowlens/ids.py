@@ -7,12 +7,14 @@ Node id shape: "<normalized_type>:<cloud_id>", e.g. "vpc:vpc-0abc123".
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 #: Map a Terraform resource type (e.g. "aws_vpc") to FlowLens's normalized
 #: resource_type (e.g. "vpc"). Anything not listed falls back to stripping
 #: the leading "aws_" prefix, which covers most 1:1 cases automatically.
+#: aws_lb / aws_alb are classified from their attributes (see below).
 _TF_TYPE_OVERRIDES = {
-    "aws_lb": "alb",
-    "aws_alb": "alb",
     "aws_lb_listener": "listener",
     "aws_alb_listener": "listener",
     "aws_lb_listener_rule": "listener_rule",
@@ -39,7 +41,30 @@ _TF_TYPE_OVERRIDES = {
 }
 
 
-def normalize_terraform_type(tf_type: str) -> str:
+#: Terraform types whose normalized type depends on `load_balancer_type`.
+_TF_LOAD_BALANCER_TYPES = frozenset({"aws_lb", "aws_alb"})
+
+
+def load_balancer_resource_type(lb_type: Any) -> str:
+    """Canonical resource_type for an ELBv2 load balancer given its type as
+    reported by Terraform (`load_balancer_type`) or AWS (`Type`).
+
+    Only a literal "network" yields "nlb". Anything else — "application",
+    missing, an unresolved HCL expression such as "${var.lb_type}", or an
+    unsupported type — deterministically falls back to "alb" (the historical
+    behaviour), so both sources agree for equivalent infrastructure.
+    """
+    return "nlb" if isinstance(lb_type, str) and lb_type.strip().lower() == "network" else "alb"
+
+
+def normalize_terraform_type(tf_type: str, attributes: Mapping[str, Any] | None = None) -> str:
+    """Map a Terraform type to FlowLens's resource_type. `attributes` (the
+    resource's parsed body / state values) is only consulted for types whose
+    classification depends on it (aws_lb: ALB vs NLB); dynamic values are
+    never evaluated.
+    """
+    if tf_type in _TF_LOAD_BALANCER_TYPES:
+        return load_balancer_resource_type((attributes or {}).get("load_balancer_type"))
     if tf_type in _TF_TYPE_OVERRIDES:
         return _TF_TYPE_OVERRIDES[tf_type]
     return tf_type[len("aws_"):] if tf_type.startswith("aws_") else tf_type

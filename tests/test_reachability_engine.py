@@ -275,7 +275,7 @@ def test_internal_alb_is_not_reachable_from_internet():
 
 def test_nlb_instance_targets_see_client_ip():
     stack = Stack()
-    stack.add(NLB_ARN, "alb", {"name": "nlb", "vpc_id": "vpc-1", "subnets": ["subnet-pub"], "security_groups": [],
+    stack.add(NLB_ARN, "nlb", {"name": "nlb", "vpc_id": "vpc-1", "subnets": ["subnet-pub"], "security_groups": [],
                                "scheme": "internet-facing", "internal": False, "type": "network"})
     stack.add("arn:nlb-l", "listener", {"load_balancer_arn": NLB_ARN, "protocol": "TCP", "port": 5000,
                                         "default_action": [{"target_group_arn": "arn:tg-i"}], "default_action_types": ["forward"]})

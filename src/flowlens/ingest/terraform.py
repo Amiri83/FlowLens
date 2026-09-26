@@ -210,7 +210,7 @@ def parse_config_dir(dir_path: Path, files: list[Path] | None = None) -> Graph:
             Node(
                 id=node_id,
                 name=_resource_name(body, name),
-                resource_type=normalize_terraform_type(tf_type) if tf_type is not None else "module",
+                resource_type=normalize_terraform_type(tf_type, body) if tf_type is not None else "module",
                 source=Source.TERRAFORM,
                 terraform_address=address,
                 metadata=metadata,
@@ -254,7 +254,7 @@ def parse_state_json(data: dict[str, Any]) -> Graph:
             continue
         tf_type, name, address = r["type"], r["name"], r["address"]
         values = r.get("values") or {}
-        normalized = normalize_terraform_type(tf_type)
+        normalized = normalize_terraform_type(tf_type, values)
         cloud_id = values.get("id")
         node_id = make_node_id(normalized, cloud_id) if cloud_id else make_tf_only_node_id(address)
         id_by_address[address] = node_id
@@ -299,7 +299,7 @@ def parse_plan_json(data: dict[str, Any]) -> Graph:
             continue
         tf_type, name, address = c["type"], c["name"], c["address"]
         after = (c.get("change") or {}).get("after") or {}
-        normalized = normalize_terraform_type(tf_type)
+        normalized = normalize_terraform_type(tf_type, after)
         cloud_id = after.get("id")
         node_id = make_node_id(normalized, cloud_id) if cloud_id else make_tf_only_node_id(address)
         id_by_address[address] = node_id

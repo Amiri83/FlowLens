@@ -115,3 +115,12 @@ def test_is_permission_error_classification():
     assert is_permission_error(err("SomethingElse", status=403))
     assert not is_permission_error(err("Throttling"))
     assert not is_permission_error(ValueError("x"))
+
+
+@mock_aws
+def test_denied_load_balancer_scan_marks_alb_and_nlb_unresolved():
+    session = DenyingSession({"elbv2.DescribeLoadBalancers": "AccessDenied"}, region_name="us-east-1")
+    report = AWSDiscoverer(region="us-east-1", session=session).discover_all().metadata["aws_scan"]
+    # Both LB types come from one API call; a Terraform NLB must not look "terraform only".
+    assert {"alb", "nlb"} <= set(report["unresolved_resource_types"])
+    assert report["denied"]["nlb"]["permission"] == "elasticloadbalancing:DescribeLoadBalancers"

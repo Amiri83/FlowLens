@@ -154,9 +154,25 @@ def _link_security_group(node: Node, state: dict, r: _Resolver) -> list[Edge]:
     return edges
 
 
-def _link_alb(node: Node, state: dict, r: _Resolver) -> list[Edge]:
+#: Normalized resource types of ELBv2 load balancers (see flowlens.ids).
+LOAD_BALANCER_TYPES = ("alb", "nlb")
+
+
+def _resolve_load_balancer(value: Any, r: _Resolver) -> list[str]:
+    for lb_type in LOAD_BALANCER_TYPES:
+        found = r.resolve(value, lb_type)
+        if found:
+            return found
+    return []
+
+
+def _link_load_balancer(node: Node, state: dict, r: _Resolver) -> list[Edge]:
     edges = []
-    for sn_id in r.resolve(state.get("subnets"), "subnet"):
+    subnets = r.resolve(state.get("subnets"), "subnet")
+    for mapping in state.get("subnet_mapping") or []:  # typical for NLBs (static IPs / EIPs)
+        if isinstance(mapping, dict):
+            subnets += [s for s in r.resolve(mapping.get("subnet_id"), "subnet") if s not in subnets]
+    for sn_id in subnets:
         edges.append(_edge(node.id, sn_id, RelationshipType.MEMBER_OF))
     for sg_id in r.resolve(state.get("security_groups"), "security_group"):
         edges.append(_edge(sg_id, node.id, RelationshipType.ALLOWS))
@@ -165,8 +181,8 @@ def _link_alb(node: Node, state: dict, r: _Resolver) -> list[Edge]:
 
 def _link_listener(node: Node, state: dict, r: _Resolver) -> list[Edge]:
     edges = []
-    for alb_id in r.resolve(state.get("load_balancer_arn"), "alb"):
-        edges.append(_edge(node.id, alb_id, RelationshipType.DEPENDS_ON))
+    for lb_id in _resolve_load_balancer(state.get("load_balancer_arn"), r):
+        edges.append(_edge(node.id, lb_id, RelationshipType.DEPENDS_ON))
     for action in state.get("default_action") or []:
         if isinstance(action, dict):
             for tg_id in r.resolve(action.get("target_group_arn"), "target_group"):
@@ -239,7 +255,8 @@ _HANDLERS: dict[str, _HandlerT] = {
     "internet_gateway": _link_internet_gateway,
     "nat_gateway": _link_nat_gateway,
     "security_group": _link_security_group,
-    "alb": _link_alb,
+    "alb": _link_load_balancer,
+    "nlb": _link_load_balancer,
     "listener": _link_listener,
     "listener_rule": _link_listener_rule,
     "target_group": _link_target_group,

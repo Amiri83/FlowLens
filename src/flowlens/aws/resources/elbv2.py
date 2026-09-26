@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from flowlens.aws.resources._common import client, resource
+from flowlens.ids import load_balancer_resource_type
 
 SERVICE = "elbv2"
 
@@ -15,10 +16,13 @@ def _load_balancers(elbv2) -> list[dict[str, Any]]:
 
 
 def scan_load_balancers(session, region: str | None) -> list[dict[str, Any]]:
+    """All load balancers; resource_type is "nlb" for Type == "network",
+    else "alb" (same rule as the Terraform side, see flowlens.ids).
+    """
     elbv2 = client(session, SERVICE, region)
     return [
         resource(
-            "alb",
+            load_balancer_resource_type(lb.get("Type")),
             lb["LoadBalancerArn"],
             lb.get("LoadBalancerName"),
             {
@@ -141,8 +145,18 @@ def scan_target_groups(session, region: str | None) -> list[dict[str, Any]]:
     return out
 
 
+def _load_balancers_of(resource_type: str):
+    def scan_one(session, region: str | None) -> list[dict[str, Any]]:
+        return [r for r in scan_load_balancers(session, region) if r["resource_type"] == resource_type]
+
+    return scan_one
+
+
+#: "alb" and "nlb" are registered separately so a failed/denied
+#: DescribeLoadBalancers marks both types unresolved in the scan report.
 RESOURCE_SCANNERS = {
-    "alb": scan_load_balancers,
+    "alb": _load_balancers_of("alb"),
+    "nlb": _load_balancers_of("nlb"),
     "listener": scan_listeners,
     "listener_rule": scan_listener_rules,
     "target_group": scan_target_groups,

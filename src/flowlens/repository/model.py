@@ -269,6 +269,9 @@ class ModuleSource:
     raw_source: str = ""
     version_constraint: str | None = None
     ref: str | None = None
+    #: False for a local source whose directory could not be read (missing,
+    #: no Terraform files, outside the anchor): it then has no configuration.
+    resolved: bool = True
     id: str = field(init=False)
     configuration: str | None = field(init=False)
 
@@ -279,7 +282,8 @@ class ModuleSource:
             _set(self, "locator", canonical_source_url(self.locator))  # never keep credentials
         _set(self, "raw_source", redact_url(self.raw_source))
         _set(self, "id", ids.module_source_id(self.kind, self.locator))
-        _set(self, "configuration", ids.configuration_id(self.locator) if self.kind is ModuleSourceKind.LOCAL else None)
+        local = self.kind is ModuleSourceKind.LOCAL and self.resolved
+        _set(self, "configuration", ids.configuration_id(self.locator) if local else None)
 
 
 @dataclass(frozen=True)
@@ -389,11 +393,13 @@ class ModuleCall:
     source: str               # ModuleSource id
     meta: MetaArguments = MetaArguments()
     evidence: str | None = None
+    inputs: tuple[str, ...] = ()  # input argument NAMES only; values are never evaluated or stored
     id: str = field(init=False)
     caller: str = field(init=False)
 
     def __post_init__(self) -> None:
         _set(self, "caller_path", ids.normalize_rel_path(self.caller_path))
+        _set(self, "inputs", _sorted_unique(self.inputs))
         _set(self, "id", ids.module_call_id(self.caller_path, self.name))
         _set(self, "caller", ids.configuration_id(self.caller_path))
 
@@ -613,6 +619,7 @@ class VarFileArtifact:
     was applied."""
 
     path: str
+    variable_names: tuple[str, ...] = ()  # assigned variable NAMES only; values never read into the model
     id: str = field(init=False)
     kind: VarFileKind = field(init=False)
     autoloaded: bool = field(init=False)
@@ -620,6 +627,7 @@ class VarFileArtifact:
 
     def __post_init__(self) -> None:
         _set(self, "path", ids.normalize_rel_path(self.path))
+        _set(self, "variable_names", _sorted_unique(self.variable_names))
         name = posixpath.basename(self.path)
         if name.endswith(".json"):
             kind = VarFileKind.TFVARS_JSON

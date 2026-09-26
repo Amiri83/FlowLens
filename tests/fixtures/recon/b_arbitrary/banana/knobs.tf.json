@@ -1,0 +1,6 @@
+{
+  "variable": {
+    "cidr": { "type": "string" },
+    "subnet_count": { "default": 2 }
+  }
+}

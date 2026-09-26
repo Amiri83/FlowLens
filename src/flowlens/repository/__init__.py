@@ -1,13 +1,16 @@
 """Repository Intelligence (RI): an evidence-backed, provider-neutral model of
 what a repository configures (see docs/adr/0001).
 
-Phase 1 is representation only: domain types, deterministic repository-relative
-identity, evidence/provenance, redaction and explanation. Nothing here is wired
+Phase 1: domain types, deterministic repository-relative identity,
+evidence/provenance, redaction and explanation. Phase 2: structural
+reconnaissance (:func:`build_repository_model`: path -> RepositoryModel; run
+``python -m flowlens.repository <path>`` to debug it). Nothing here is wired
 into the production scanner, and this package never imports the graph, AWS,
 discovery, linking or reachability layers.
 """
 from __future__ import annotations
 
+from flowlens.repository.build import ReconSummary, analyze_repository, build_repository_model, summarize
 from flowlens.repository.enums import (
     ROOT_CAPABLE_ROLES,
     AmbiguityKind,
@@ -114,6 +117,7 @@ __all__ = [
     "Polarity",
     "ProvenanceKind",
     "RawArtifact",
+    "ReconSummary",
     "ReadStatus",
     "RepositoryAnchor",
     "RepositoryModel",
@@ -127,8 +131,11 @@ __all__ = [
     "TerraformConfiguration",
     "VarFileArtifact",
     "VarFileKind",
+    "analyze_repository",
+    "build_repository_model",
     "explain",
     "independent",
     "min_confidence",
     "schema_version",
+    "summarize",
 ]

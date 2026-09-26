@@ -107,7 +107,11 @@ flowlens ui --db data/example.db          # http://127.0.0.1:8000
 
 `flowlens scan` accepts:
 
-- a directory of `.tf` files, or a single `.tf` file (parsed with python-hcl2; no `terraform` binary needed),
+- a directory of `.tf` files, or a single `.tf` file (parsed with python-hcl2; no `terraform` binary, `terraform init`,
+  AWS credentials or network needed). Directories are scanned recursively (`.terraform/`, `.terragrunt-cache/` and
+  `.git/` are skipped). `resource`, `data` (`data.<type>.<name>`) and `module` call (`module.<name>`) blocks become
+  nodes; child-module sources are not resolved. A file that fails to parse is skipped with a warning instead of
+  aborting the scan,
 - a raw `terraform.tfstate` (format v4, including `count`/`for_each` instances and module addresses),
 - the output of `terraform show -json` for state or for a plan (`terraform show -json plan.out`).
 
